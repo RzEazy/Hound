@@ -6,8 +6,8 @@ import json
 import subprocess
 import platform
 
-class Lia:
-    def __init__(self, api_key, memory_file="lia_memory.json"):
+class hound:
+    def __init__(self, api_key, memory_file="hound_memory.json"):
         self.co = cohere.Client(api_key)
         self.memory_file = memory_file
         self.load_memory()
@@ -80,7 +80,7 @@ macOS: open -a "Google Chrome"
         """Just normal AI chat."""
         
         history = self.build_history()
-        prompt = f"{history}User: {user_input}\nLia:"
+        prompt = f"{history}User: {user_input}\Hound:"
         
         response = self.co.chat(
             model="command-a-03-2025",
@@ -94,7 +94,7 @@ macOS: open -a "Google Chrome"
         
         history = ""
         for conv in self.memory["conversations"]:
-            history += f"User: {conv['user']}\nLia: {conv['lia']}\n"
+            history += f"User: {conv['user']}\nHound: {conv['Hound']}\n"
         return history
 
     def run_system_command(self, command):
@@ -126,6 +126,6 @@ macOS: open -a "Google Chrome"
     def save_in_memory(self, user_input, response):
         self.memory["conversations"].append({
             "user": user_input,
-            "lia": response
+            "Hound": response
         })
         self.save_memory()
