@@ -10,7 +10,7 @@ from engines.command_engine import CommandEngine
 from engines.osquery_engine import OsqueryEngine
 from tools.formatter import ResultFormatter
 
-class LiaMain:
+class HoundMain:
     def __init__(self, api_key: str, memory_file: str = "hound_memory.json"):
         # Initialize core components
         self.co = cohere.Client(api_key)
@@ -134,4 +134,3 @@ class LiaMain:
             self.memory.add_query(sql_query, str(results))
         
         return formatted_response
-

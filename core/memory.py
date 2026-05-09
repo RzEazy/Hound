@@ -2,7 +2,7 @@ import json
 from typing import List, Dict, Any
 
 class MemoryManager:
-    def __init__(self, memory_file: str = "lia_memory.json"):
+    def __init__(self, memory_file: str = "hound_memory.json"):
         self.memory_file = memory_file
         self.load_memory()
     
@@ -55,7 +55,7 @@ class MemoryManager:
         """Add a conversation turn to memory"""
         self.memory["conversations"].append({
             "user": user_input,
-            "lia": response
+            "hound": response
         })
         # Keep only last 50 conversations to prevent memory bloat
         if len(self.memory["conversations"]) > 50:

@@ -4,13 +4,13 @@ from .base_chain import BaseChain
 
 # Define template directly to avoid import issues
 CHAT_PROMPT_TEMPLATE = """
-You are Lia, a helpful AI assistant. Keep your responses concise and friendly.
+You are Hound, a helpful AI assistant. Keep your responses concise and friendly.
 
 Previous conversation:
 {history}
 
 User: {user_input}
-Lia:"""
+Hound:"""
 
 class ChatChain(BaseChain):
     def __init__(self, co_client: cohere.Client):
@@ -27,7 +27,7 @@ class ChatChain(BaseChain):
         history = ""
         conversations = context.get("conversations", [])
         for conv in conversations:
-            history += f"User: {conv['user']}\nLia: {conv['lia']}\n"
+            history += f"User: {conv['user']}\nHound: {conv['hound']}\n"
         
         # Construct prompt
         prompt = CHAT_PROMPT_TEMPLATE.format(

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-LiaAI – Professional Left-Aligned TUI (White Text • Modern Design)
+Hound – Professional Left-Aligned TUI (White Text • Modern Design)
 Inspired by: Gemini CLI • Claude • Warp • Perplexity
 """
 import os
@@ -21,25 +21,25 @@ except ImportError:
     print("Rich library not found. Install with: pip install rich")
     sys.exit(1)
 
-from core.lia_main import LiaMain
+from core.hound import HoundMain
 
 
-class LiaTUI:
+class HoundTUI:
     def __init__(self):
         self.console = Console()
-        self.lia = None
-        self.initialize_lia()
+        self.hound = None
+        self.initialize_hound()
 
-    def initialize_lia(self):
+    def initialize_hound(self):
         api_key = os.getenv("COHERE_API_KEY", "doeM32W2so3ubfYYs673lmiOmUzwN15weKfB68bj")
         try:
-            self.lia = LiaMain(api_key=api_key, memory_file="Hound_memory.json")
+            self.hound = HoundMain(api_key=api_key, memory_file="hound_memory.json")
         except Exception as e:
-            self.console.print(f"[bold red]Failed to initialize LiaAI: {e}[/bold red]")
+            self.console.print(f"[bold red]Failed to initialize Hound: {e}[/bold red]")
             sys.exit(1)
 
     def header(self):
-        # ───── HoundAI ASCII Logo ─────
+        # ───── Hound ASCII Logo ─────
         logo = Text(
             " ██╗  ██╗ ██████╗ ██╗   ██╗███╗   ██╗██████╗ \n"
             " ██║  ██║██╔═══██╗██║   ██║████╗  ██║██╔══██╗\n"
@@ -85,7 +85,7 @@ class LiaTUI:
         return Padding(bubble, pad=(0, 4, 1, 0))  # Left-aligned with margin
 
     def assistant_message(self, text: str):
-        label = Text("HoundAI\n", style="bold #22d3ee")
+        label = Text("Hound\n", style="bold #22d3ee")
         try:
             md = Markdown(
                 text,
@@ -108,7 +108,7 @@ class LiaTUI:
 
     def thinking(self):
         return Padding(
-            Text("● LiaAI is thinking...", style="white dim"),
+            Text("● Hound is thinking...", style="white dim"),
             pad=(0, 4)
         )
 
@@ -124,7 +124,7 @@ class LiaTUI:
 
         # Initial greeting
         greeting = (
-            "Hello! I'm **HoundAI**, your advanced cybersecurity assistant.\n\n"
+            "Hello! I'm **Hound**, your advanced cybersecurity assistant.\n\n"
             "**How can I assist you today?**"
         )
         self.console.print(self.assistant_message(greeting))
@@ -162,7 +162,7 @@ class LiaTUI:
 
                 # Thinking
                 with Live(self.thinking(), refresh_per_second=8, console=self.console):
-                    response = self.lia.process_input(user_input)
+                    response = self.hound.process_input(user_input)
 
                 # Display assistant response
                 self.console.print(self.assistant_message(response))
@@ -175,7 +175,7 @@ class LiaTUI:
 
 
 def main():
-    app = LiaTUI()
+    app = HoundTUI()
     app.run()
 
 

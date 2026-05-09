@@ -1,13 +1,13 @@
-from core.lia_main import LiaMain
+from core.hound import HoundMain
 
-# Initialize Lia with your Cohere API key
-lia = LiaMain(
+# Initialize Hound with your Cohere API key
+hound = HoundMain(
     api_key="doeM32W2so3ubfYYs673lmiOmUzwN15weKfB68bj",
-    memory_file="lia_memory.json"
+    memory_file="hound_memory.json"
 )
 
 def chat():
-    print("LiaAI - Modular Cyber Assistant")
+    print("Hound - Modular Cyber Assistant")
     print("Ask me anything - I can chat, run commands, or query system security!")
     print("Type 'exit', 'quit', 'bye', or 'goodbye' to exit.\n")
 
@@ -15,11 +15,11 @@ def chat():
         user_input = input("You: ")
 
         if user_input.lower() in ["exit", "quit", "bye", "goodbye"]:
-            print("Lia: Peace!")
+            print("Hound: Peace!")
             break
 
-        response = lia.process_input(user_input)
-        print("Lia:", response)
+        response = hound.process_input(user_input)
+        print("Hound:", response)
         print()  # Add spacing for readability
 
 if __name__ == "__main__":
