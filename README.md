@@ -1,6 +1,6 @@
-# LiaAI — 0.3.0
+# HoundAI — 0.3.0
 
-LiaAI has evolved into a modular, LLM-powered cyber-OS assistant with three core capabilities:
+HoundAI has evolved into a modular, LLM-powered cyber-OS assistant with three core capabilities:
 
 1. **Natural Language Chat** - General conversation and assistance
 2. **OS Command Execution** - Safe execution of system commands
