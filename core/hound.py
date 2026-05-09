@@ -11,7 +11,7 @@ from engines.osquery_engine import OsqueryEngine
 from tools.formatter import ResultFormatter
 
 class LiaMain:
-    def __init__(self, api_key: str, memory_file: str = "lia_memory.json"):
+    def __init__(self, api_key: str, memory_file: str = "hound_memory.json"):
         # Initialize core components
         self.co = cohere.Client(api_key)
         self.router = IntentRouter(self.co)
