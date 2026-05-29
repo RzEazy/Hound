@@ -347,7 +347,10 @@ class HoundTUI:
             progress_pct = (step_current / max(budget_total, 1)) * 100
             bar_filled = int(progress_pct / 5)
             bar_empty = 20 - bar_filled
-            progress_bar = f"[{THEME['accent_green']}]{'━' * bar_filled}[/][{THEME['text_muted']}]{'─' * bar_empty}[/]"
+            progress_bar = Text.assemble(
+                ("━" * bar_filled, THEME['accent_green']),
+                ("─" * bar_empty, THEME['text_muted']),
+            )
 
             sev_display = Text.assemble(
                 (f"● {severity_counts['critical']} ", SEVERITY_STYLE["critical"]),
@@ -364,8 +367,9 @@ class HoundTUI:
             header_grid.add_row(
                 Text(f" Phase: {phase}", style=f"bold {THEME['accent_cyan']}"),
                 Text.assemble(
-                    Text(f"Step {step_current}/{budget_total} ", style="white"),
-                    Text(f" {progress_bar} ", style="white"),
+                    (f"Step {step_current}/{budget_total} ", "white"),
+                    (" ", ""),
+                    progress_bar,
                 ),
                 sev_display,
             )
@@ -438,11 +442,18 @@ class HoundTUI:
                 except (IndexError, ValueError):
                     pass
             elif "Finding:" in msg:
-                # Parse finding from log
+                # Parse finding from log — format: "Finding: [SEV] title (category)"
                 try:
                     sev_match = msg.split("[")[1].split("]")[0].lower()
-                    title = msg.split("] ")[1] if "] " in msg else msg
-                    findings_list.append({"severity": sev_match, "title": title, "category": ""})
+                    rest = msg.split("] ")[1] if "] " in msg else msg
+                    # Extract category from parentheses at end
+                    category = ""
+                    if "(" in rest and rest.endswith(")"):
+                        category = rest.rsplit("(", 1)[1].rstrip(")")
+                        title = rest.rsplit("(", 1)[0].strip()
+                    else:
+                        title = rest
+                    findings_list.append({"severity": sev_match, "title": title, "category": category})
                     severity_counts[sev_match] = severity_counts.get(sev_match, 0) + 1
                 except (IndexError, KeyError):
                     pass

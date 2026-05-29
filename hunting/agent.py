@@ -80,6 +80,18 @@ RULES:
 - Each query should build on previous findings — pivot on PIDs, IPs, filenames, users discovered
 - If a previous query FAILED, do NOT retry with the same columns — use the verified schema
 - Focus on IOCs: unusual processes, suspicious network connections, persistence mechanisms, privilege escalation artifacts
+- Do NOT investigate the same process/table repeatedly if previous queries returned no suspicious results
+
+KNOWN-GOOD BASELINES (do NOT flag these as suspicious unless behavior is anomalous):
+- Firefox, Chrome, Chromium and their wrappers (.firefox-wrappe, chrome-sandbox) making HTTPS connections to known CDNs/services
+- System processes: systemd, init, kthreadd, kworker, rcu_*, irq/*, ksoftirqd
+- Package managers: apt, dpkg, pacman, nix-daemon, nix-build
+- Desktop processes: Xorg, Wayland, gnome-*, plasma-*, dbus-daemon
+- Servers (if intentionally installed): httpd, nginx, sshd, postgres, mysql, docker*
+- Tor is suspicious ONLY if: running as root, listening on non-standard ports, or making connections to known C2 IPs
+
+FAILED TABLES/QUERIES (do NOT use these again):
+{failed_context}
 """
 
 ANALYZER_PROMPT = """You are analyzing osquery results as part of an autonomous threat hunt.
@@ -103,7 +115,22 @@ Analyze these results and respond with EXACTLY one JSON object:
   "pivot_suggestions": ["<next query ideas based on these results>"]
 }}
 
-Be objective. Not everything is malicious — flag truly suspicious items and label benign results as "info" severity.
+BASELINE AWARENESS — do NOT flag these as suspicious:
+- Browsers (firefox, chrome, .firefox-wrappe) connecting to well-known IPs (Google, Cloudflare, GitHub, Meta, etc.) on port 443
+- Standard system processes (systemd, init, dbus, NetworkManager, pulseaudio, pipewire)
+- httpd/nginx if multiple workers exist under a single parent (normal MPM behavior)
+- Docker daemon and containers (unless running suspicious binaries)
+- Tor ONLY if running under a dedicated 'tor' user with standard config
+
+WHAT IS ACTUALLY SUSPICIOUS:
+- Processes running from /tmp, /dev/shm, /var/tmp
+- Processes with no path on disk (on_disk = 0)
+- Connections to known-bad ports (4444, 5555, 6666, 31337, 9001 from non-Tor)
+- SUID binaries outside /usr/bin, /usr/sbin, /usr/lib
+- Cron entries with wget/curl/base64/eval
+- Shell history containing encoded commands, reverse shells, or credential theft
+
+Be objective and precise. Mark genuinely benign findings as "info" severity.
 """
 
 QUERY_FIX_PROMPT = """The following osquery SQL query failed with an error. Fix it using ONLY the verified columns listed.
@@ -172,6 +199,8 @@ class ThreatHuntingAgent:
         self.progress_callback = progress_callback or (lambda msg: None)
         self._schema_cache: Dict[str, List[str]] = {}
         self._llm_cache: Dict[str, Dict[str, Any]] = {}  # #7 cache
+        self._failed_queries: set = set()  # Track failed queries to avoid loops
+        self._failed_tables: set = set()  # Track tables that don't exist
 
     def hunt(self, hypothesis: str) -> FindingsGraph:
         """
@@ -221,9 +250,9 @@ class ThreatHuntingAgent:
             # Get live schema for relevant tables (#1)
             schema_context = self._get_schema_context(findings_context)
 
-            # Check cache (#7)
+            # Check cache (#7) — but NOT if the last step was an error
             cache_key = self._cache_key(findings_context)
-            if cache_key in self._llm_cache:
+            if cache_key in self._llm_cache and not self._failed_queries:
                 action = self._llm_cache[cache_key]
                 self.progress_callback("  (using cached plan)")
             else:
@@ -259,6 +288,11 @@ class ThreatHuntingAgent:
                 self.progress_callback("  No query generated, skipping.")
                 continue
 
+            # Skip if we've already tried this exact query and it failed
+            if sql_query in self._failed_queries:
+                self.progress_callback("  Skipping — this query already failed previously.")
+                continue
+
             # Safety check
             is_safe, reason = self.safety.is_osquery_sql_safe(sql_query)
             if not is_safe:
@@ -270,17 +304,25 @@ class ThreatHuntingAgent:
 
             if error:
                 self.progress_callback(f"  Query error: {error}")
+                self._failed_queries.add(sql_query)
+                # Track the table if it doesn't exist
+                if "no such table" in error.lower():
+                    table_match = re.search(r'no such table:\s*(\w+)', error, re.IGNORECASE)
+                    if table_match:
+                        self._failed_tables.add(table_match.group(1))
                 # Attempt fix (#2)
                 fixed_sql = self._fix_query(sql_query, error, purpose)
-                if fixed_sql and fixed_sql != sql_query:
+                if fixed_sql and fixed_sql != sql_query and fixed_sql not in self._failed_queries:
                     self.progress_callback(f"  Retrying with fixed query: {fixed_sql}")
                     results, error = self.osquery_engine.execute_query(fixed_sql)
                     sql_query = fixed_sql
+                    if error:
+                        self._failed_queries.add(fixed_sql)
 
                 if error:
                     finding = Finding(
                         title=f"Query failed: {purpose}",
-                        description=f"Query `{sql_query}` failed: {error}. Columns may not exist on this system.",
+                        description=f"Query `{sql_query}` failed: {error}. Table/columns may not exist on this system.",
                         severity=Severity.INFO,
                         category=self._parse_category(category_str),
                         query_used=sql_query,
@@ -323,7 +365,7 @@ class ThreatHuntingAgent:
                     mitre_technique=analysis.get("mitre_technique", ""),
                 )
                 graph.add_finding(finding)
-                self.progress_callback(f"  Finding: [{finding.severity.value.upper()}] {finding.title}")
+                self.progress_callback(f"  Finding: [{finding.severity.value.upper()}] {finding.title} ({finding.category.value})")
 
                 # Dynamic budget adjustment (#6)
                 if finding.severity in (Severity.HIGH, Severity.CRITICAL):
@@ -340,10 +382,10 @@ class ThreatHuntingAgent:
                 self.progress_callback(f"  {CONSECUTIVE_INFO_TO_CONCLUDE} consecutive info-level results, concluding.")
                 break
 
-        # If loop exhausted without concluding
+        # If loop exhausted without concluding, generate a proper conclusion
         if not graph.conclusion:
-            graph.conclusion = "Investigation complete. No definitive indicators of compromise found, though monitoring is recommended."
-            graph.confidence_score = 0.5
+            graph.conclusion = self._generate_conclusion(hypothesis, graph)
+            graph.confidence_score = self._calculate_confidence(graph)
 
         graph.ended_at = datetime.now().isoformat()
         self.progress_callback(f"\nHunt complete. {len(graph.findings)} findings. Budget used: {steps_taken}/{budget}")
@@ -513,6 +555,56 @@ class ThreatHuntingAgent:
             pass
         return None
 
+    # ─── Conclusion Generation ──────────────────────────────────────────
+
+    def _generate_conclusion(self, hypothesis: str, graph: FindingsGraph) -> str:
+        """Generate a proper conclusion using LLM based on all findings."""
+        findings_summary = self._build_findings_context(graph)
+        stats = graph.summary_stats()
+
+        prompt = f"""Based on this autonomous threat hunt, generate a concise 2-3 sentence conclusion.
+
+HYPOTHESIS: {hypothesis}
+FINDINGS SUMMARY:
+{findings_summary}
+
+SEVERITY BREAKDOWN: {json.dumps(stats)}
+
+Respond with ONLY the conclusion text (no JSON, no formatting). Be specific about what was found or not found."""
+
+        try:
+            response = self.co.chat(
+                model="command-a-03-2025",
+                message=prompt,
+                temperature=0.1,
+            )
+            return response.text.strip()
+        except Exception:
+            return "Investigation complete. No definitive indicators of compromise found."
+
+    def _calculate_confidence(self, graph: FindingsGraph) -> float:
+        """Calculate confidence score based on findings quality."""
+        if not graph.findings:
+            return 0.3
+
+        total = len(graph.findings)
+        high_plus = len([f for f in graph.findings.values()
+                        if f.severity in (Severity.HIGH, Severity.CRITICAL)])
+        medium = len([f for f in graph.findings.values()
+                     if f.severity == Severity.MEDIUM])
+        failed = len([f for f in graph.findings.values()
+                     if "failed" in f.title.lower()])
+
+        # More successful queries with clear results = higher confidence
+        success_rate = (total - failed) / max(total, 1)
+        # Higher severity findings increase confidence (we found something definitive)
+        if high_plus > 0:
+            return min(0.9, 0.6 + (high_plus * 0.1))
+        elif medium > 0:
+            return min(0.8, 0.5 + (medium * 0.05) + (success_rate * 0.2))
+        else:
+            return min(0.7, 0.4 + (success_rate * 0.3))
+
     # ─── Batch Queries (#8) ────────────────────────────────────────────
 
     def _execute_batch(self, queries: List[str]) -> List[Tuple[str, List[Dict], str]]:
@@ -558,6 +650,14 @@ class ThreatHuntingAgent:
                         step: int, budget: int,
                         schema_context: str, rag_context: str) -> Optional[Dict[str, Any]]:
         """Ask LLM to decide the next investigation step."""
+        # Build failed context
+        failed_parts = []
+        if self._failed_tables:
+            failed_parts.append(f"Tables that do NOT exist: {', '.join(self._failed_tables)}")
+        if self._failed_queries:
+            failed_parts.append(f"Queries that failed (do not retry): {'; '.join(list(self._failed_queries)[-5:])}")
+        failed_context = "\n".join(failed_parts) if failed_parts else "None"
+
         prompt = PLANNER_PROMPT.format(
             hypothesis=hypothesis,
             findings_context=findings_context,
@@ -566,6 +666,7 @@ class ThreatHuntingAgent:
             schema_context=schema_context,
             rag_context=rag_context,
             golden_trace=GOLDEN_TRACE if step <= 3 else "",  # Only show trace early
+            failed_context=failed_context,
         )
 
         try:

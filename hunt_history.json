@@ -24,5 +24,31 @@
       "medium": 2,
       "info": 9
     }
+  },
+  {
+    "hunt_id": "d3344f68",
+    "hypothesis": "Investigate this system for signs of compromise, persistence mechanisms, and suspicious activity.",
+    "started_at": "2026-05-29T20:24:45.047855",
+    "ended_at": "2026-05-29T20:25:33.451716",
+    "conclusion": "The investigation revealed no signs of compromise or persistence mechanisms, with all crontab and process checks returning clear results. However, a Firefox wrapper process exhibited unusual behavior, including multiple connections to various remote addresses and listening on a non-standard port, warranting further scrutiny. Ultimately, the process was determined to be a legitimate Firefox instance with typical browser behavior, and no malicious activity was identified.",
+    "confidence": 0.8,
+    "num_findings": 8,
+    "max_severity": "medium",
+    "indicators": [
+      "2607:6bc0::10",
+      "2a03:2880:f335:120:face:b00c:0:167",
+      "PID: 8594",
+      "Remote Port: 443",
+      "8594",
+      "Remote Addresses: 140.82.114.25, 34.107.243.93, 2607:6bc0::10, 2a03:2880:f335:120:face:b00c:0:167, 2600:1901:0:179c::",
+      "Process Name: .firefox-wrappe",
+      "140.82.114.25",
+      "51621",
+      "2600:1901:0:179c::"
+    ],
+    "summary_stats": {
+      "medium": 2,
+      "info": 6
+    }
   }
 ]
