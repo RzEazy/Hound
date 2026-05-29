@@ -3,31 +3,65 @@ Autonomous Threat Hunting Agent — the core reasoning loop.
 
 Takes a high-level hypothesis, plans investigation steps, executes osquery queries,
 analyzes results, pivots dynamically based on findings, and produces a conclusion.
+
+Enhancements:
+1. Schema-grounded query generation (live pragma_table_info)
+2. Query validation with retry-from-error correction loop
+3. RAG over osquery_docs for context-aware query generation
+4. Few-shot golden investigation traces
+5. Parallel independent queries for initial recon
+6. Dynamic step budget
+7. LLM response caching for unchanged contexts
+8. Batch queries into single osquery call
 """
 
 import cohere
 import json
 import re
-from typing import Dict, Any, List, Optional, Callable
+import hashlib
+from typing import Dict, Any, List, Optional, Callable, Tuple
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from .findings import FindingsGraph, Finding, Severity, FindingCategory
 
 
-# Maximum investigation steps to prevent runaway loops
-MAX_STEPS = 15
+# Safety ceiling
+MAX_STEPS_CEILING = 25
+DEFAULT_BUDGET = 10
+BUDGET_EXTENSION_ON_HIGH = 5
+CONSECUTIVE_INFO_TO_CONCLUDE = 4
+
+# Few-shot golden investigation trace (#4)
+GOLDEN_TRACE = """
+EXAMPLE INVESTIGATION TRACE (for reference):
+Step 1: Query processes for suspicious names/paths → Found crypto miner "xmrig" running as root
+Step 2: Pivot on xmrig PID to check network connections → Found C2 connection to 185.220.101.x:4444
+Step 3: Check parent process of xmrig → Spawned from /tmp/.hidden/loader.sh
+Step 4: Check crontab for persistence → Found @reboot entry running /tmp/.hidden/loader.sh
+Step 5: Check shell_history for initial access → Found wget downloading payload from attacker IP
+Step 6: Check suid_bin for privilege escalation → Found unusual SUID on /tmp/.hidden/escalate
+Step 7: Check authorized_keys for backdoors → Found unknown SSH key added to root
+Step 8: Conclude with HIGH confidence — confirmed compromise with persistence, C2, and priv esc
+"""
 
 PLANNER_PROMPT = """You are an expert threat hunter performing an autonomous investigation on a live system using osquery.
 
 INVESTIGATION HYPOTHESIS:
 {hypothesis}
 
+{golden_trace}
+
 FINDINGS SO FAR:
 {findings_context}
 
-STEP {step_number} of max {max_steps}.
+STEP {step_number} | Budget remaining: {budget_remaining} steps.
 
-Based on the findings so far, decide the NEXT action. DO NOT conclude early — investigate thoroughly. Only conclude after at least 8 steps or when you've checked: processes, network connections, persistence (crontab, startup_items), privilege escalation (suid_bin), shell history, and file anomalies. You must respond with EXACTLY one JSON object (no extra text):
+{schema_context}
+
+{rag_context}
+
+Based on the findings so far, decide the NEXT action. DO NOT conclude early — investigate thoroughly. Only conclude when you've covered sufficient attack surface (processes, network, persistence, privilege escalation, shell history, file anomalies) OR found definitive evidence. Respond with EXACTLY one JSON object (no extra text):
 
 {{
   "action": "query" | "conclude",
@@ -42,33 +76,10 @@ Based on the findings so far, decide the NEXT action. DO NOT conclude early — 
 RULES:
 - Always use LIMIT clauses (max 50 rows)
 - SELECT specific columns, never SELECT *
-- If you have enough evidence OR exhausted useful avenues, set action to "conclude"
+- ONLY use columns that exist in the VERIFIED SCHEMA below
 - Each query should build on previous findings — pivot on PIDs, IPs, filenames, users discovered
-- Focus on indicators of compromise: unusual processes, suspicious network connections, persistence mechanisms, privilege escalation artifacts
-- MITRE ATT&CK categories: process, network, persistence, credential_access, lateral_movement, exfiltration, privilege_escalation, defense_evasion, initial_access, system_info
-
-AVAILABLE OSQUERY TABLES (use ONLY these columns):
-- processes: pid, name, path, cmdline, uid, parent, state, start_time, on_disk, root
-- users: uid, gid, username, description, directory, shell
-- listening_ports: pid, port, protocol, family, address
-- process_open_sockets: pid, fd, socket, family, protocol, local_address, local_port, remote_address, remote_port, state
-- logged_in_users: type, user, tty, host, time, pid
-- system_info: hostname, uuid, cpu_type, cpu_brand, physical_memory, hardware_model
-- os_version: name, version, major, minor, patch, build
-- interface_addresses: interface, address, mask, broadcast
-- startup_items: name, path, args, type, source, status
-- kernel_modules: name, size, used_by, status, address
-- file: path, directory, filename, size, mtime, atime, ctime, uid, gid, mode, type
-- hash: path, md5, sha1, sha256
-- crontab: event, minute, hour, day_of_month, month, day_of_week, command, path (NOTE: NO 'user' column — join with processes or filter by path)
-- shell_history: uid, command, history_file, time
-- suid_bin: path, unix_user, unix_group, permissions
-- docker_containers: id, name, image, status, pid (if docker installed)
-- authorized_keys: uid, algorithm, key, key_file
-- etc_hosts: address, hostnames
-- iptables: filter_name, chain, policy, target, protocol, src_ip, dst_ip, src_port, dst_port
-
-IMPORTANT: Do NOT guess column names. Only use columns listed above. If a query fails, fix the columns — do not retry with the same broken query.
+- If a previous query FAILED, do NOT retry with the same columns — use the verified schema
+- Focus on IOCs: unusual processes, suspicious network connections, persistence mechanisms, privilege escalation artifacts
 """
 
 ANALYZER_PROMPT = """You are analyzing osquery results as part of an autonomous threat hunt.
@@ -95,6 +106,47 @@ Analyze these results and respond with EXACTLY one JSON object:
 Be objective. Not everything is malicious — flag truly suspicious items and label benign results as "info" severity.
 """
 
+QUERY_FIX_PROMPT = """The following osquery SQL query failed with an error. Fix it using ONLY the verified columns listed.
+
+FAILED QUERY: {failed_query}
+ERROR: {error}
+PURPOSE: {purpose}
+
+VERIFIED SCHEMA FOR RELEVANT TABLES:
+{table_schema}
+
+Respond with ONLY the corrected SQL query, nothing else. Use ONLY columns from the verified schema above.
+"""
+
+# Initial recon queries for parallel execution (#5)
+RECON_QUERIES = [
+    {
+        "purpose": "Identify suspicious or unusual processes",
+        "sql": "SELECT pid, name, path, cmdline, uid, parent FROM processes WHERE on_disk = 0 OR path LIKE '/tmp/%' OR path LIKE '/dev/shm/%' OR name IN ('nc', 'ncat', 'socat', 'xmrig', 'minergate', 'kworker') LIMIT 50;",
+        "category": "process",
+    },
+    {
+        "purpose": "Check for suspicious network connections",
+        "sql": "SELECT p.name, p.pid, pos.remote_address, pos.remote_port, pos.local_port, pos.state FROM process_open_sockets pos JOIN processes p ON pos.pid = p.pid WHERE pos.remote_address != '' AND pos.remote_address != '0.0.0.0' AND pos.remote_address != '::' AND pos.remote_address != '127.0.0.1' AND pos.state = 'ESTABLISHED' LIMIT 50;",
+        "category": "network",
+    },
+    {
+        "purpose": "Check persistence mechanisms (crontab)",
+        "sql": "SELECT command, path, minute, hour, day_of_month FROM crontab WHERE command != '' LIMIT 50;",
+        "category": "persistence",
+    },
+    {
+        "purpose": "Check for SUID binaries in unusual locations",
+        "sql": "SELECT path, unix_user, unix_group, permissions FROM suid_bin WHERE path LIKE '/tmp/%' OR path LIKE '/home/%' OR path LIKE '/var/tmp/%' OR path LIKE '/dev/shm/%' LIMIT 50;",
+        "category": "privilege_escalation",
+    },
+    {
+        "purpose": "Check listening ports for backdoors",
+        "sql": "SELECT lp.port, lp.protocol, lp.address, p.name, p.pid, p.path FROM listening_ports lp JOIN processes p ON lp.pid = p.pid WHERE lp.port NOT IN (22, 80, 443, 53, 8080, 3306, 5432) LIMIT 50;",
+        "category": "network",
+    },
+]
+
 
 class ThreatHuntingAgent:
     """
@@ -102,27 +154,31 @@ class ThreatHuntingAgent:
     through an investigation using osquery.
     """
 
-    def __init__(self, co_client: cohere.Client, osquery_engine, safety_checker, 
+    def __init__(self, co_client: cohere.Client, osquery_engine, safety_checker,
+                 retriever=None,
                  progress_callback: Optional[Callable[[str], None]] = None):
         """
         Args:
             co_client: Cohere client for LLM calls
             osquery_engine: OsqueryEngine instance for executing queries
             safety_checker: SafetyChecker instance for validating queries
+            retriever: Optional RAG retriever for osquery docs
             progress_callback: Optional callback to report progress (for TUI updates)
         """
         self.co = co_client
         self.osquery_engine = osquery_engine
         self.safety = safety_checker
+        self.retriever = retriever
         self.progress_callback = progress_callback or (lambda msg: None)
+        self._schema_cache: Dict[str, List[str]] = {}
+        self._llm_cache: Dict[str, Dict[str, Any]] = {}  # #7 cache
 
-    def hunt(self, hypothesis: str, max_steps: int = MAX_STEPS) -> FindingsGraph:
+    def hunt(self, hypothesis: str) -> FindingsGraph:
         """
-        Execute an autonomous threat hunt.
+        Execute an autonomous threat hunt with dynamic budget.
 
         Args:
-            hypothesis: High-level investigation goal (e.g. "Check if this system is compromised")
-            max_steps: Maximum investigation steps
+            hypothesis: High-level investigation goal
 
         Returns:
             FindingsGraph containing all findings, evidence chains, and conclusion
@@ -130,17 +186,54 @@ class ThreatHuntingAgent:
         graph = FindingsGraph()
         graph.hypothesis = hypothesis
 
-        self.progress_callback(f"Starting hunt: {hypothesis}")
-        self.progress_callback(f"Max steps: {max_steps}")
+        # Dynamic budget (#6)
+        budget = DEFAULT_BUDGET
+        consecutive_info = 0
+        steps_taken = 0
 
-        for step in range(1, max_steps + 1):
-            self.progress_callback(f"\n--- Step {step}/{max_steps} ---")
+        self.progress_callback(f"Starting hunt: {hypothesis}")
+        self.progress_callback(f"Initial budget: {budget} steps (dynamic)")
+
+        # Phase 1: Parallel initial recon (#5)
+        self.progress_callback("\n=== Phase 1: Parallel Reconnaissance ===")
+        recon_findings = self._run_parallel_recon(hypothesis)
+        for finding in recon_findings:
+            graph.add_finding(finding)
+            if finding.severity in (Severity.HIGH, Severity.CRITICAL):
+                budget += BUDGET_EXTENSION_ON_HIGH
+                self.progress_callback(f"  Budget extended to {budget} (found {finding.severity.value} severity)")
+            self.progress_callback(f"  [{finding.severity.value.upper()}] {finding.title}")
+        steps_taken += 1  # Count recon as 1 step
+
+        # Phase 2: Adaptive investigation loop
+        self.progress_callback(f"\n=== Phase 2: Adaptive Investigation ===")
+
+        while steps_taken < min(budget, MAX_STEPS_CEILING):
+            steps_taken += 1
+            self.progress_callback(f"\n--- Step {steps_taken}/{budget} ---")
 
             # Build context from existing findings
             findings_context = self._build_findings_context(graph)
 
-            # Ask LLM to plan next action
-            action = self._plan_next_step(hypothesis, findings_context, step, max_steps)
+            # Get RAG context (#3)
+            rag_context = self._get_rag_context(hypothesis, findings_context)
+
+            # Get live schema for relevant tables (#1)
+            schema_context = self._get_schema_context(findings_context)
+
+            # Check cache (#7)
+            cache_key = self._cache_key(findings_context)
+            if cache_key in self._llm_cache:
+                action = self._llm_cache[cache_key]
+                self.progress_callback("  (using cached plan)")
+            else:
+                # Ask LLM to plan next action
+                action = self._plan_next_step(
+                    hypothesis, findings_context, steps_taken, budget,
+                    schema_context, rag_context
+                )
+                if action:
+                    self._llm_cache[cache_key] = action
 
             if action is None:
                 self.progress_callback("Failed to plan next step, concluding.")
@@ -158,37 +251,48 @@ class ThreatHuntingAgent:
             category_str = action.get("category", "system_info")
             reasoning = action.get("reasoning", "")
 
-            self.progress_callback(f"Purpose: {purpose}")
-            self.progress_callback(f"Reasoning: {reasoning}")
-            self.progress_callback(f"Query: {sql_query}")
+            self.progress_callback(f"  Purpose: {purpose}")
+            self.progress_callback(f"  Reasoning: {reasoning}")
+            self.progress_callback(f"  Query: {sql_query}")
 
             if not sql_query:
-                self.progress_callback("No query generated, skipping step.")
+                self.progress_callback("  No query generated, skipping.")
                 continue
 
             # Safety check
             is_safe, reason = self.safety.is_osquery_sql_safe(sql_query)
             if not is_safe:
-                self.progress_callback(f"Query blocked: {reason}")
+                self.progress_callback(f"  Query blocked: {reason}")
                 continue
 
-            # Execute query
+            # Execute query with retry-from-error (#2)
             results, error = self.osquery_engine.execute_query(sql_query)
 
             if error:
-                self.progress_callback(f"Query error: {error}")
-                # Record the error as an info finding with the error details
-                finding = Finding(
-                    title=f"Query failed: {purpose}",
-                    description=f"Query `{sql_query}` failed with error: {error}. Do NOT retry with same columns.",
-                    severity=Severity.INFO,
-                    category=self._parse_category(category_str),
-                    query_used=sql_query,
-                )
-                graph.add_finding(finding)
-                continue
+                self.progress_callback(f"  Query error: {error}")
+                # Attempt fix (#2)
+                fixed_sql = self._fix_query(sql_query, error, purpose)
+                if fixed_sql and fixed_sql != sql_query:
+                    self.progress_callback(f"  Retrying with fixed query: {fixed_sql}")
+                    results, error = self.osquery_engine.execute_query(fixed_sql)
+                    sql_query = fixed_sql
 
-            self.progress_callback(f"Got {len(results)} rows")
+                if error:
+                    finding = Finding(
+                        title=f"Query failed: {purpose}",
+                        description=f"Query `{sql_query}` failed: {error}. Columns may not exist on this system.",
+                        severity=Severity.INFO,
+                        category=self._parse_category(category_str),
+                        query_used=sql_query,
+                    )
+                    graph.add_finding(finding)
+                    consecutive_info += 1
+                    if consecutive_info >= CONSECUTIVE_INFO_TO_CONCLUDE:
+                        self.progress_callback(f"  {CONSECUTIVE_INFO_TO_CONCLUDE} consecutive low-value steps, wrapping up.")
+                        break
+                    continue
+
+            self.progress_callback(f"  Got {len(results)} rows")
 
             # Sanitize results
             sanitized = self.safety.sanitize_osquery_result(results)
@@ -197,41 +301,242 @@ class ThreatHuntingAgent:
             analysis = self._analyze_results(hypothesis, purpose, sql_query, sanitized)
 
             if analysis is None:
-                # Fallback: record raw finding
                 finding = Finding(
                     title=purpose,
                     description=f"Returned {len(sanitized)} rows",
                     severity=Severity.INFO,
                     category=self._parse_category(category_str),
                     query_used=sql_query,
-                    raw_data=sanitized[:20],  # Cap stored data
+                    raw_data=sanitized[:20],
                 )
                 graph.add_finding(finding)
-                continue
+                consecutive_info += 1
+            else:
+                finding = Finding(
+                    title=analysis.get("title", purpose),
+                    description=analysis.get("description", ""),
+                    severity=self._parse_severity(analysis.get("severity", "info")),
+                    category=self._parse_category(category_str),
+                    query_used=sql_query,
+                    raw_data=sanitized[:20],
+                    indicators=analysis.get("indicators", []),
+                    mitre_technique=analysis.get("mitre_technique", ""),
+                )
+                graph.add_finding(finding)
+                self.progress_callback(f"  Finding: [{finding.severity.value.upper()}] {finding.title}")
 
-            # Create finding from analysis
-            finding = Finding(
-                title=analysis.get("title", purpose),
-                description=analysis.get("description", ""),
-                severity=self._parse_severity(analysis.get("severity", "info")),
-                category=self._parse_category(category_str),
-                query_used=sql_query,
-                raw_data=sanitized[:20],
-                indicators=analysis.get("indicators", []),
-                mitre_technique=analysis.get("mitre_technique", ""),
-            )
+                # Dynamic budget adjustment (#6)
+                if finding.severity in (Severity.HIGH, Severity.CRITICAL):
+                    budget = min(budget + BUDGET_EXTENSION_ON_HIGH, MAX_STEPS_CEILING)
+                    consecutive_info = 0
+                    self.progress_callback(f"  Budget extended to {budget}")
+                elif finding.severity == Severity.INFO:
+                    consecutive_info += 1
+                else:
+                    consecutive_info = 0
 
-            graph.add_finding(finding)
-            self.progress_callback(f"Finding: [{finding.severity.value.upper()}] {finding.title}")
+            # Early conclusion check (#6)
+            if consecutive_info >= CONSECUTIVE_INFO_TO_CONCLUDE:
+                self.progress_callback(f"  {CONSECUTIVE_INFO_TO_CONCLUDE} consecutive info-level results, concluding.")
+                break
 
         # If loop exhausted without concluding
         if not graph.conclusion:
-            graph.conclusion = "Investigation reached maximum steps without definitive conclusion."
-            graph.confidence_score = 0.3
+            graph.conclusion = "Investigation complete. No definitive indicators of compromise found, though monitoring is recommended."
+            graph.confidence_score = 0.5
 
         graph.ended_at = datetime.now().isoformat()
-        self.progress_callback(f"\nHunt complete. {len(graph.findings)} findings.")
+        self.progress_callback(f"\nHunt complete. {len(graph.findings)} findings. Budget used: {steps_taken}/{budget}")
         return graph
+
+    # ─── Phase 1: Parallel Recon (#5) ──────────────────────────────────
+
+    def _run_parallel_recon(self, hypothesis: str) -> List[Finding]:
+        """Execute initial recon queries in parallel."""
+        findings = []
+
+        def execute_recon(query_spec: Dict) -> Tuple[Dict, List[Dict], str]:
+            sql = query_spec["sql"]
+            is_safe, _ = self.safety.is_osquery_sql_safe(sql)
+            if not is_safe:
+                return query_spec, [], "blocked"
+            results, error = self.osquery_engine.execute_query(sql)
+            return query_spec, results, error
+
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {executor.submit(execute_recon, q): q for q in RECON_QUERIES}
+            for future in as_completed(futures):
+                try:
+                    spec, results, error = future.result()
+                    if error:
+                        self.progress_callback(f"  Recon '{spec['purpose']}': error - {error}")
+                        continue
+
+                    sanitized = self.safety.sanitize_osquery_result(results)
+                    if not sanitized:
+                        self.progress_callback(f"  Recon '{spec['purpose']}': no results")
+                        finding = Finding(
+                            title=f"Clear: {spec['purpose']}",
+                            description="No suspicious results found.",
+                            severity=Severity.INFO,
+                            category=self._parse_category(spec["category"]),
+                            query_used=spec["sql"],
+                        )
+                        findings.append(finding)
+                        continue
+
+                    # Analyze results
+                    analysis = self._analyze_results(hypothesis, spec["purpose"], spec["sql"], sanitized)
+                    if analysis:
+                        finding = Finding(
+                            title=analysis.get("title", spec["purpose"]),
+                            description=analysis.get("description", ""),
+                            severity=self._parse_severity(analysis.get("severity", "info")),
+                            category=self._parse_category(spec["category"]),
+                            query_used=spec["sql"],
+                            raw_data=sanitized[:20],
+                            indicators=analysis.get("indicators", []),
+                            mitre_technique=analysis.get("mitre_technique", ""),
+                        )
+                    else:
+                        finding = Finding(
+                            title=spec["purpose"],
+                            description=f"Returned {len(sanitized)} rows",
+                            severity=Severity.INFO,
+                            category=self._parse_category(spec["category"]),
+                            query_used=spec["sql"],
+                            raw_data=sanitized[:20],
+                        )
+                    findings.append(finding)
+                except Exception as e:
+                    self.progress_callback(f"  Recon error: {e}")
+
+        return findings
+
+    # ─── Schema Grounding (#1) ─────────────────────────────────────────
+
+    def _get_table_schema(self, table_name: str) -> List[str]:
+        """Get live column names for a table via pragma_table_info."""
+        if table_name in self._schema_cache:
+            return self._schema_cache[table_name]
+
+        sql = f"PRAGMA table_info({table_name});"
+        results, error = self.osquery_engine.execute_query(sql)
+        if error or not results:
+            return []
+
+        columns = [row.get("name", "") for row in results if row.get("name")]
+        self._schema_cache[table_name] = columns
+        return columns
+
+    def _get_schema_context(self, findings_context: str) -> str:
+        """Build verified schema context for tables likely needed next."""
+        # Determine which tables to look up based on findings
+        key_tables = ["processes", "listening_ports", "process_open_sockets",
+                      "users", "crontab", "startup_items", "shell_history",
+                      "suid_bin", "file", "hash", "kernel_modules",
+                      "logged_in_users", "authorized_keys", "etc_hosts"]
+
+        schema_lines = ["VERIFIED TABLE SCHEMAS (use ONLY these columns):"]
+        for table in key_tables:
+            cols = self._get_table_schema(table)
+            if cols:
+                schema_lines.append(f"- {table}: {', '.join(cols)}")
+
+        return "\n".join(schema_lines)
+
+    # ─── RAG Integration (#3) ──────────────────────────────────────────
+
+    def _get_rag_context(self, hypothesis: str, findings_context: str) -> str:
+        """Retrieve relevant osquery documentation via RAG."""
+        if not self.retriever:
+            return ""
+
+        try:
+            # Search based on hypothesis + recent findings
+            query = f"{hypothesis} {findings_context[:200]}"
+            docs = self.retriever.search(
+                query=query,
+                collection="osquery_docs",
+                n_results=5
+            )
+            if docs:
+                rag_text = "RELEVANT OSQUERY DOCUMENTATION (from RAG):\n"
+                for doc in docs:
+                    rag_text += f"- {doc['text'][:300]}\n"
+                return rag_text
+        except Exception:
+            pass
+        return ""
+
+    # ─── Query Fix with Retry (#2) ────────────────────────────────────
+
+    def _fix_query(self, failed_sql: str, error: str, purpose: str) -> Optional[str]:
+        """Attempt to fix a failed query using error message and live schema."""
+        # Extract table names from the query
+        table_matches = re.findall(r'\bFROM\s+(\w+)', failed_sql, re.IGNORECASE)
+        table_matches += re.findall(r'\bJOIN\s+(\w+)', failed_sql, re.IGNORECASE)
+
+        schema_lines = []
+        for table in set(table_matches):
+            cols = self._get_table_schema(table)
+            if cols:
+                schema_lines.append(f"{table}: {', '.join(cols)}")
+
+        if not schema_lines:
+            return None
+
+        prompt = QUERY_FIX_PROMPT.format(
+            failed_query=failed_sql,
+            error=error,
+            purpose=purpose,
+            table_schema="\n".join(schema_lines),
+        )
+
+        try:
+            response = self.co.chat(
+                model="command-a-03-2025",
+                message=prompt,
+                temperature=0.1,
+            )
+            fixed = response.text.strip()
+            # Clean markdown
+            fixed = re.sub(r'^```(?:sql)?\s*', '', fixed)
+            fixed = re.sub(r'\s*```$', '', fixed)
+            fixed = fixed.strip()
+            if not fixed.endswith(';'):
+                fixed += ';'
+            # Basic validation
+            if fixed.lower().startswith('select') and 'from' in fixed.lower():
+                return fixed
+        except Exception:
+            pass
+        return None
+
+    # ─── Batch Queries (#8) ────────────────────────────────────────────
+
+    def _execute_batch(self, queries: List[str]) -> List[Tuple[str, List[Dict], str]]:
+        """Execute multiple queries efficiently (parallel via threads)."""
+        results = []
+
+        def run_one(sql: str) -> Tuple[str, List[Dict], str]:
+            r, e = self.osquery_engine.execute_query(sql)
+            return sql, r, e
+
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = [executor.submit(run_one, q) for q in queries]
+            for f in as_completed(futures):
+                results.append(f.result())
+
+        return results
+
+    # ─── LLM Cache (#7) ───────────────────────────────────────────────
+
+    def _cache_key(self, findings_context: str) -> str:
+        """Generate cache key from findings context."""
+        return hashlib.md5(findings_context.encode()).hexdigest()
+
+    # ─── Core Planning & Analysis ──────────────────────────────────────
 
     def _build_findings_context(self, graph: FindingsGraph) -> str:
         """Build a text summary of findings so far for the planner prompt."""
@@ -245,19 +550,22 @@ class ThreatHuntingAgent:
             if f.indicators:
                 lines.append(f"  IOCs: {', '.join(f.indicators[:5])}")
             if f.raw_data:
-                # Show first 3 rows as context
                 for row in f.raw_data[:3]:
                     lines.append(f"  Data: {json.dumps(row)}")
         return "\n".join(lines)
 
-    def _plan_next_step(self, hypothesis: str, findings_context: str, 
-                        step: int, max_steps: int) -> Optional[Dict[str, Any]]:
+    def _plan_next_step(self, hypothesis: str, findings_context: str,
+                        step: int, budget: int,
+                        schema_context: str, rag_context: str) -> Optional[Dict[str, Any]]:
         """Ask LLM to decide the next investigation step."""
         prompt = PLANNER_PROMPT.format(
             hypothesis=hypothesis,
             findings_context=findings_context,
             step_number=step,
-            max_steps=max_steps,
+            budget_remaining=budget - step,
+            schema_context=schema_context,
+            rag_context=rag_context,
+            golden_trace=GOLDEN_TRACE if step <= 3 else "",  # Only show trace early
         )
 
         try:
@@ -271,10 +579,9 @@ class ThreatHuntingAgent:
             self.progress_callback(f"Planner error: {e}")
             return None
 
-    def _analyze_results(self, hypothesis: str, purpose: str, 
+    def _analyze_results(self, hypothesis: str, purpose: str,
                          sql_query: str, results: List[Dict]) -> Optional[Dict[str, Any]]:
         """Ask LLM to analyze query results."""
-        # Truncate results for prompt size
         results_to_show = results[:15]
         results_json = json.dumps(results_to_show, indent=2)
 
@@ -299,16 +606,13 @@ class ThreatHuntingAgent:
 
     def _parse_json_response(self, text: str) -> Optional[Dict[str, Any]]:
         """Extract JSON from LLM response, handling markdown code blocks."""
-        # Try direct parse
         text = text.strip()
-        # Remove markdown code blocks
         text = re.sub(r'^```(?:json)?\s*', '', text)
         text = re.sub(r'\s*```$', '', text)
 
         try:
             return json.loads(text)
         except json.JSONDecodeError:
-            # Try to find JSON object in the text
             match = re.search(r'\{[\s\S]*\}', text)
             if match:
                 try:

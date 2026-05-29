@@ -173,10 +173,21 @@ class LiaMain:
         if len(hypothesis) < 10:
             hypothesis = "Investigate this system for signs of compromise, persistence mechanisms, and suspicious activity."
 
+        # Set up RAG retriever if available
+        retriever = None
+        try:
+            from rag.retriever import Retriever
+            from rag.vectordb import VectorDB
+            vectordb = VectorDB()
+            retriever = Retriever(vectordb)
+        except Exception:
+            pass
+
         agent = ThreatHuntingAgent(
             co_client=self.co,
             osquery_engine=self.osquery_engine,
             safety_checker=self.safety,
+            retriever=retriever,
             progress_callback=progress_callback or (lambda msg: None),
         )
 
