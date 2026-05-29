@@ -31,7 +31,7 @@ class LiaTUI:
         self.initialize_lia()
 
     def initialize_lia(self):
-        api_key = os.getenv("COHERE_API_KEY", "doeM32W2so3ubfYYs673lmiOmUzwN15weKfB68bj")
+        api_key = os.getenv("COHERE_API_KEY")
         try:
             self.lia = LiaMain(api_key=api_key, memory_file="Hound_memory.json")
         except Exception as e:
@@ -108,9 +108,41 @@ class LiaTUI:
 
     def thinking(self):
         return Padding(
-            Text("● LiaAI is thinking...", style="white dim"),
+            Text("● HoundAI is thinking...", style="white dim"),
             pad=(0, 4)
         )
+
+    def _run_hunt(self, user_input: str) -> str:
+        """Run autonomous hunt with live progress updates."""
+        progress_lines = []
+
+        def progress_callback(msg: str):
+            progress_lines.append(msg)
+            # Update the live display
+            display_text = "\n".join(progress_lines[-12:])  # Show last 12 lines
+            live.update(Padding(
+                Panel(
+                    Text(display_text, style="white"),
+                    title="[bold #22d3ee]Autonomous Hunt in Progress[/]",
+                    border_style="#4c1d95",
+                    padding=(1, 2),
+                ),
+                pad=(0, 4)
+            ))
+
+        live = Live(
+            Padding(
+                Text("● Initializing autonomous threat hunt...", style="white dim"),
+                pad=(0, 4)
+            ),
+            refresh_per_second=4,
+            console=self.console,
+        )
+
+        with live:
+            response = self.lia._handle_hunt(user_input, progress_callback=progress_callback)
+
+        return response
 
     def run(self):
         self.console.clear()
@@ -120,7 +152,9 @@ class LiaTUI:
                            Text("quit", style="bold yellow") +
                            Text(" or ", style="dim white") +
                            Text("exit", style="bold yellow") +
-                           Text(" to leave\n", style="dim white"))
+                           Text(" to leave • ", style="dim white") +
+                           Text("hunt", style="bold #22d3ee") +
+                           Text(" to start autonomous threat hunt\n", style="dim white"))
 
         # Initial greeting
         greeting = (
@@ -160,9 +194,13 @@ class LiaTUI:
                 self.console.print(self.user_message(user_input))
                 self.console.print()
 
-                # Thinking
-                with Live(self.thinking(), refresh_per_second=8, console=self.console):
-                    response = self.lia.process_input(user_input)
+                # Check if this is a hunt request (needs special live progress)
+                if self.lia._is_hunt_request(user_input):
+                    response = self._run_hunt(user_input)
+                else:
+                    # Thinking
+                    with Live(self.thinking(), refresh_per_second=8, console=self.console):
+                        response = self.lia.process_input(user_input)
 
                 # Display assistant response
                 self.console.print(self.assistant_message(response))

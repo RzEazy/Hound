@@ -1,5 +1,5 @@
 import cohere
-from typing import Dict, Any
+from typing import Dict, Any, Optional, Callable
 from core.router import IntentRouter, Intent
 from core.memory import MemoryManager
 from core.safety import SafetyChecker
@@ -9,6 +9,9 @@ from chains.osquery_chain import OsqueryChain
 from engines.command_engine import CommandEngine
 from engines.osquery_engine import OsqueryEngine
 from tools.formatter import ResultFormatter
+from hunting.agent import ThreatHuntingAgent
+from hunting.findings import FindingsGraph
+from hunting.report import ReportGenerator
 
 class LiaMain:
     def __init__(self, api_key: str, memory_file: str = "lia_memory.json"):
@@ -29,6 +32,10 @@ class LiaMain:
         
         # Initialize formatter
         self.formatter = ResultFormatter()
+        
+        # Initialize threat hunting components
+        self.report_generator = ReportGenerator()
+        self.last_hunt: Optional[FindingsGraph] = None
 
     
     def process_input(self, user_input: str) -> str:
@@ -38,6 +45,14 @@ class LiaMain:
             from tools.security_dashboard import SecurityDashboard
             dashboard = SecurityDashboard(self)
             return dashboard.generate_dashboard()
+
+        # Threat hunt trigger
+        if self._is_hunt_request(user_input):
+            return self._handle_hunt(user_input)
+
+        # Hunt report request
+        if user_input.lower().strip() in ("hunt report", "last hunt", "show hunt"):
+            return self._show_last_hunt_report()
 
         # Get context from memory
         context = self.memory.get_memory_context()
@@ -134,4 +149,57 @@ class LiaMain:
             self.memory.add_query(sql_query, str(results))
         
         return formatted_response
+
+    # ─── Threat Hunting ───────────────────────────────────────────────
+
+    def _is_hunt_request(self, user_input: str) -> bool:
+        """Detect if the user wants to start an autonomous hunt."""
+        triggers = [
+            "hunt", "threat hunt", "investigate", "autonomous",
+            "is this machine compromised", "full investigation",
+            "deep scan", "hunt for threats", "start hunt",
+        ]
+        lower = user_input.lower().strip()
+        return any(t in lower for t in triggers)
+
+    def _handle_hunt(self, user_input: str, 
+                     progress_callback: Optional[Callable[[str], None]] = None) -> str:
+        """Execute an autonomous threat hunt."""
+        if not self.osquery_engine.is_osquery_installed():
+            return "Osquery is not installed. The threat hunter requires osquery to investigate this system."
+
+        # Use the user input as the hypothesis, or a default
+        hypothesis = user_input.strip()
+        if len(hypothesis) < 10:
+            hypothesis = "Investigate this system for signs of compromise, persistence mechanisms, and suspicious activity."
+
+        agent = ThreatHuntingAgent(
+            co_client=self.co,
+            osquery_engine=self.osquery_engine,
+            safety_checker=self.safety,
+            progress_callback=progress_callback or (lambda msg: None),
+        )
+
+        graph = agent.hunt(hypothesis)
+        self.last_hunt = graph
+
+        # Generate brief report for inline display
+        brief = self.report_generator.generate_brief(graph)
+
+        # Save to memory
+        self.memory.add_conversation(user_input, f"[HUNT:{graph.hunt_id}] {graph.conclusion}")
+
+        return brief
+
+    def _show_last_hunt_report(self) -> str:
+        """Show the full report from the last hunt."""
+        if self.last_hunt is None:
+            return "No hunt has been performed yet. Type `hunt` or describe what to investigate."
+        return self.report_generator.generate_markdown(self.last_hunt)
+
+    def get_hunt_json(self) -> Optional[str]:
+        """Export last hunt as JSON (for saving/sharing)."""
+        if self.last_hunt is None:
+            return None
+        return self.report_generator.generate_json(self.last_hunt)
 
