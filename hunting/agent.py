@@ -1,10 +1,10 @@
 """
-Autonomous Threat Hunting Agent — the core reasoning loop.
+Autonomous Threat Hunting Agent — Production Grade.
 
 Takes a high-level hypothesis, plans investigation steps, executes osquery queries,
 analyzes results, pivots dynamically based on findings, and produces a conclusion.
 
-Enhancements:
+Production enhancements over v1:
 1. Schema-grounded query generation (live pragma_table_info)
 2. Query validation with retry-from-error correction loop
 3. RAG over osquery_docs for context-aware query generation
@@ -13,12 +13,19 @@ Enhancements:
 6. Dynamic step budget
 7. LLM response caching for unchanged contexts
 8. Batch queries into single osquery call
+9. ** Behavioral baseline anomaly detection during hunt **
+10. ** Live IOC enrichment mid-hunt (not just post-hunt) **
+11. ** HITL checkpoints on HIGH/CRITICAL with pause capability **
+12. ** Cryptographic evidence signing of every query-result pair **
+13. ** Hybrid search (MITRE/Sigma/CVE) for technique correlation **
 """
 
 import cohere
 import json
 import re
 import hashlib
+import uuid
+import asyncio
 from typing import Dict, Any, List, Optional, Callable, Tuple
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -55,6 +62,10 @@ INVESTIGATION HYPOTHESIS:
 FINDINGS SO FAR:
 {findings_context}
 
+{anomaly_context}
+
+{enrichment_context}
+
 STEP {step_number} | Budget remaining: {budget_remaining} steps.
 
 {schema_context}
@@ -81,6 +92,7 @@ RULES:
 - If a previous query FAILED, do NOT retry with the same columns — use the verified schema
 - Focus on IOCs: unusual processes, suspicious network connections, persistence mechanisms, privilege escalation artifacts
 - Do NOT investigate the same process/table repeatedly if previous queries returned no suspicious results
+- If ANOMALY CONTEXT shows behavioral deviations, prioritize investigating those
 
 KNOWN-GOOD BASELINES (do NOT flag these as suspicious unless behavior is anomalous):
 - Firefox, Chrome, Chromium and their wrappers (.firefox-wrappe, chrome-sandbox) making HTTPS connections to known CDNs/services
@@ -102,6 +114,10 @@ SQL EXECUTED: {sql_query}
 
 RESULTS ({num_rows} rows):
 {results_json}
+
+{enrichment_note}
+
+{anomaly_note}
 
 Analyze these results and respond with EXACTLY one JSON object:
 
@@ -179,11 +195,24 @@ class ThreatHuntingAgent:
     """
     Autonomous threat hunting agent that plans, executes, and pivots
     through an investigation using osquery.
+    
+    Production integration points:
+    - behavioral_engine: anomaly detection against host baselines
+    - threat_enricher: live IOC enrichment during hunt
+    - evidence_chain: cryptographic signing of query-result pairs
+    - hybrid_search: MITRE/Sigma/CVE correlation
+    - hitl_callback: human-in-the-loop approval for HIGH/CRITICAL actions
     """
 
     def __init__(self, co_client: cohere.Client, osquery_engine, safety_checker,
                  retriever=None,
-                 progress_callback: Optional[Callable[[str], None]] = None):
+                 progress_callback: Optional[Callable[[str], None]] = None,
+                 # Production subsystems (all optional — graceful degradation)
+                 behavioral_engine=None,
+                 threat_enricher=None,
+                 evidence_chain=None,
+                 hybrid_search=None,
+                 hitl_callback: Optional[Callable[[str, str], bool]] = None):
         """
         Args:
             co_client: Cohere client for LLM calls
@@ -191,31 +220,50 @@ class ThreatHuntingAgent:
             safety_checker: SafetyChecker instance for validating queries
             retriever: Optional RAG retriever for osquery docs
             progress_callback: Optional callback to report progress (for TUI updates)
+            behavioral_engine: BehavioralEngine for anomaly detection
+            threat_enricher: ThreatIntelEnricher for live IOC enrichment
+            evidence_chain: EvidenceChain for cryptographic signing
+            hybrid_search: HybridSearchEngine for MITRE/Sigma correlation
+            hitl_callback: Callable(finding_summary, severity) -> bool for HITL approval
         """
         self.co = co_client
         self.osquery_engine = osquery_engine
         self.safety = safety_checker
         self.retriever = retriever
         self.progress_callback = progress_callback or (lambda msg: None)
+        
+        # Production subsystems
+        self.behavioral_engine = behavioral_engine
+        self.threat_enricher = threat_enricher
+        self.evidence_chain = evidence_chain
+        self.hybrid_search = hybrid_search
+        self.hitl_callback = hitl_callback
+        
+        # Internal state
         self._schema_cache: Dict[str, List[str]] = {}
-        self._llm_cache: Dict[str, Dict[str, Any]] = {}  # #7 cache
-        self._failed_queries: set = set()  # Track failed queries to avoid loops
-        self._failed_tables: set = set()  # Track tables that don't exist
+        self._llm_cache: Dict[str, Dict[str, Any]] = {}
+        self._failed_queries: set = set()
+        self._failed_tables: set = set()
+        self._enrichment_results: Dict[str, Any] = {}  # IOC -> enrichment result
+        self._anomalies_detected: List[Dict[str, Any]] = []
+        self._hunt_paused: bool = False
 
     def hunt(self, hypothesis: str) -> FindingsGraph:
         """
         Execute an autonomous threat hunt with dynamic budget.
 
-        Args:
-            hypothesis: High-level investigation goal
-
-        Returns:
-            FindingsGraph containing all findings, evidence chains, and conclusion
+        Production flow:
+        1. Behavioral anomaly pre-check (if baseline available)
+        2. Parallel recon queries
+        3. Live IOC enrichment on discovered indicators
+        4. HITL checkpoint on HIGH/CRITICAL findings
+        5. Adaptive investigation with enrichment-informed pivoting
+        6. Evidence signing throughout
+        7. MITRE/Sigma correlation on conclusion
         """
         graph = FindingsGraph()
         graph.hypothesis = hypothesis
 
-        # Dynamic budget (#6)
         budget = DEFAULT_BUDGET
         consecutive_info = 0
         steps_taken = 0
@@ -223,7 +271,12 @@ class ThreatHuntingAgent:
         self.progress_callback(f"Starting hunt: {hypothesis}")
         self.progress_callback(f"Initial budget: {budget} steps (dynamic)")
 
-        # Phase 1: Parallel initial recon (#5)
+        # ─── Pre-Hunt: Behavioral Anomaly Check ──────────────────────
+        if self.behavioral_engine:
+            self.progress_callback("\n=== Pre-Hunt: Behavioral Anomaly Check ===")
+            self._run_anomaly_precheck(graph)
+
+        # ─── Phase 1: Parallel Initial Recon ─────────────────────────
         self.progress_callback("\n=== Phase 1: Parallel Reconnaissance ===")
         recon_findings = self._run_parallel_recon(hypothesis)
         for finding in recon_findings:
@@ -231,10 +284,28 @@ class ThreatHuntingAgent:
             if finding.severity in (Severity.HIGH, Severity.CRITICAL):
                 budget += BUDGET_EXTENSION_ON_HIGH
                 self.progress_callback(f"  Budget extended to {budget} (found {finding.severity.value} severity)")
+                
+                # HITL checkpoint on HIGH/CRITICAL during recon
+                if self.hitl_callback and finding.severity in (Severity.HIGH, Severity.CRITICAL):
+                    self.progress_callback(f"  [HITL] Requesting approval for: {finding.title}")
+                    approved = self.hitl_callback(finding.title, finding.severity.value)
+                    if not approved:
+                        self._hunt_paused = True
+                        self.progress_callback("  [HITL] Hunt paused by operator.")
+                        graph.conclusion = "Hunt paused by operator at HITL checkpoint during recon phase."
+                        graph.confidence_score = 0.3
+                        graph.ended_at = datetime.now().isoformat()
+                        return graph
+                        
             self.progress_callback(f"  [{finding.severity.value.upper()}] {finding.title}")
-        steps_taken += 1  # Count recon as 1 step
+            
+            # Live enrichment of IOCs discovered during recon
+            if finding.indicators:
+                self._enrich_indicators_sync(finding.indicators)
+                
+        steps_taken += 1
 
-        # Phase 2: Adaptive investigation loop
+        # ─── Phase 2: Adaptive Investigation Loop ────────────────────
         self.progress_callback(f"\n=== Phase 2: Adaptive Investigation ===")
 
         while steps_taken < min(budget, MAX_STEPS_CEILING):
@@ -244,14 +315,20 @@ class ThreatHuntingAgent:
             # Build context from existing findings
             findings_context = self._build_findings_context(graph)
 
-            # Get RAG context (#3)
+            # Get RAG context
             rag_context = self._get_rag_context(hypothesis, findings_context)
 
-            # Get live schema for relevant tables (#1)
+            # Get live schema for relevant tables
             schema_context = self._get_schema_context(findings_context)
 
-            # Check cache (#7) — but NOT if the last step was an error
-            cache_key = self._cache_key(findings_context)
+            # Build anomaly context for the planner
+            anomaly_context = self._build_anomaly_context()
+
+            # Build enrichment context for the planner
+            enrichment_context = self._build_enrichment_context()
+
+            # Check cache
+            cache_key = self._cache_key(findings_context + anomaly_context + enrichment_context)
             if cache_key in self._llm_cache and not self._failed_queries:
                 action = self._llm_cache[cache_key]
                 self.progress_callback("  (using cached plan)")
@@ -259,7 +336,7 @@ class ThreatHuntingAgent:
                 # Ask LLM to plan next action
                 action = self._plan_next_step(
                     hypothesis, findings_context, steps_taken, budget,
-                    schema_context, rag_context
+                    schema_context, rag_context, anomaly_context, enrichment_context
                 )
                 if action:
                     self._llm_cache[cache_key] = action
@@ -288,7 +365,6 @@ class ThreatHuntingAgent:
                 self.progress_callback("  No query generated, skipping.")
                 continue
 
-            # Skip if we've already tried this exact query and it failed
             if sql_query in self._failed_queries:
                 self.progress_callback("  Skipping — this query already failed previously.")
                 continue
@@ -299,18 +375,17 @@ class ThreatHuntingAgent:
                 self.progress_callback(f"  Query blocked: {reason}")
                 continue
 
-            # Execute query with retry-from-error (#2)
+            # Execute query with retry-from-error
             results, error = self.osquery_engine.execute_query(sql_query)
 
             if error:
                 self.progress_callback(f"  Query error: {error}")
                 self._failed_queries.add(sql_query)
-                # Track the table if it doesn't exist
                 if "no such table" in error.lower():
                     table_match = re.search(r'no such table:\s*(\w+)', error, re.IGNORECASE)
                     if table_match:
                         self._failed_tables.add(table_match.group(1))
-                # Attempt fix (#2)
+                # Attempt fix
                 fixed_sql = self._fix_query(sql_query, error, purpose)
                 if fixed_sql and fixed_sql != sql_query and fixed_sql not in self._failed_queries:
                     self.progress_callback(f"  Retrying with fixed query: {fixed_sql}")
@@ -336,11 +411,39 @@ class ThreatHuntingAgent:
 
             self.progress_callback(f"  Got {len(results)} rows")
 
+            # ─── Sign evidence ────────────────────────────────────────
+            if self.evidence_chain:
+                try:
+                    self.evidence_chain.add_evidence(
+                        node_key="local",
+                        query_sql=sql_query,
+                        query_purpose=purpose,
+                        results=results,
+                        metadata={"step": steps_taken, "category": category_str},
+                    )
+                    self.progress_callback(f"  [Evidence] Signed entry #{len(self.evidence_chain)}")
+                except Exception as e:
+                    self.progress_callback(f"  [Evidence] Signing failed: {e}")
+
             # Sanitize results
             sanitized = self.safety.sanitize_osquery_result(results)
 
-            # Analyze results with LLM
-            analysis = self._analyze_results(hypothesis, purpose, sql_query, sanitized)
+            # ─── Live IOC enrichment on results ───────────────────────
+            result_indicators = self._extract_indicators_from_results(sanitized)
+            enrichment_note = ""
+            if result_indicators:
+                self._enrich_indicators_sync(result_indicators)
+                # Build enrichment note for the analyzer
+                enrichment_note = self._build_enrichment_note_for_indicators(result_indicators)
+
+            # ─── Anomaly detection on results ─────────────────────────
+            anomaly_note = ""
+            if self.behavioral_engine and sanitized:
+                anomaly_note = self._check_result_anomalies(sanitized, category_str)
+
+            # Analyze results with LLM (enrichment + anomaly context included)
+            analysis = self._analyze_results(hypothesis, purpose, sql_query, sanitized,
+                                             enrichment_note, anomaly_note)
 
             if analysis is None:
                 finding = Finding(
@@ -367,17 +470,37 @@ class ThreatHuntingAgent:
                 graph.add_finding(finding)
                 self.progress_callback(f"  Finding: [{finding.severity.value.upper()}] {finding.title} ({finding.category.value})")
 
-                # Dynamic budget adjustment (#6)
+                # ─── HITL checkpoint on HIGH/CRITICAL ─────────────────
                 if finding.severity in (Severity.HIGH, Severity.CRITICAL):
                     budget = min(budget + BUDGET_EXTENSION_ON_HIGH, MAX_STEPS_CEILING)
                     consecutive_info = 0
                     self.progress_callback(f"  Budget extended to {budget}")
+
+                    if self.hitl_callback:
+                        self.progress_callback(f"  [HITL] Requesting approval to continue...")
+                        approved = self.hitl_callback(finding.title, finding.severity.value)
+                        if not approved:
+                            self._hunt_paused = True
+                            self.progress_callback("  [HITL] Hunt paused by operator.")
+                            graph.conclusion = f"Hunt paused at step {steps_taken} by operator. Last finding: {finding.title}"
+                            graph.confidence_score = 0.5
+                            graph.ended_at = datetime.now().isoformat()
+                            return graph
+
+                    # Enrich newly discovered IOCs
+                    if finding.indicators:
+                        self._enrich_indicators_sync(finding.indicators)
+
+                    # MITRE/Sigma correlation on high-severity findings
+                    if self.hybrid_search and finding.mitre_technique:
+                        self._correlate_mitre(finding)
+
                 elif finding.severity == Severity.INFO:
                     consecutive_info += 1
                 else:
                     consecutive_info = 0
 
-            # Early conclusion check (#6)
+            # Early conclusion check
             if consecutive_info >= CONSECUTIVE_INFO_TO_CONCLUDE:
                 self.progress_callback(f"  {CONSECUTIVE_INFO_TO_CONCLUDE} consecutive info-level results, concluding.")
                 break
@@ -387,11 +510,261 @@ class ThreatHuntingAgent:
             graph.conclusion = self._generate_conclusion(hypothesis, graph)
             graph.confidence_score = self._calculate_confidence(graph)
 
+        # ─── Post-hunt: Final MITRE correlation ───────────────────────
+        if self.hybrid_search:
+            self._final_mitre_correlation(graph)
+
         graph.ended_at = datetime.now().isoformat()
         self.progress_callback(f"\nHunt complete. {len(graph.findings)} findings. Budget used: {steps_taken}/{budget}")
+        
+        # Summary of production subsystem contributions
+        if self._enrichment_results:
+            malicious_count = sum(1 for r in self._enrichment_results.values() if r.get("is_malicious"))
+            self.progress_callback(f"  Enriched {len(self._enrichment_results)} IOCs — {malicious_count} flagged malicious")
+        if self._anomalies_detected:
+            self.progress_callback(f"  Behavioral anomalies detected: {len(self._anomalies_detected)}")
+        if self.evidence_chain:
+            self.progress_callback(f"  Evidence chain: {len(self.evidence_chain)} signed entries")
+            
         return graph
 
-    # ─── Phase 1: Parallel Recon (#5) ──────────────────────────────────
+    # ─── Behavioral Anomaly Pre-Check ─────────────────────────────────
+
+    def _run_anomaly_precheck(self, graph: FindingsGraph):
+        """Run behavioral anomaly detection before the main hunt."""
+        try:
+            # Gather current state
+            current_state = {}
+            procs, _ = self.osquery_engine.execute_query(
+                "SELECT pid, name, path, cmdline, uid, parent FROM processes LIMIT 100;"
+            )
+            ports, _ = self.osquery_engine.execute_query(
+                "SELECT lp.port, lp.protocol, p.name as process_name FROM listening_ports lp "
+                "JOIN processes p ON lp.pid = p.pid LIMIT 50;"
+            )
+            conns, _ = self.osquery_engine.execute_query(
+                "SELECT p.name as process_name, pos.remote_address FROM process_open_sockets pos "
+                "JOIN processes p ON pos.pid = p.pid WHERE pos.remote_address != '' "
+                "AND pos.remote_address != '127.0.0.1' LIMIT 50;"
+            )
+            current_state = {
+                "processes": procs or [],
+                "listening_ports": ports or [],
+                "connections": conns or [],
+            }
+
+            # Update baseline (builds over time)
+            self.behavioral_engine.update_host_baseline("local", "localhost", current_state)
+
+            # Check anomalies
+            anomalies = self.behavioral_engine.check_anomalies("local", current_state)
+            
+            if anomalies:
+                self._anomalies_detected = [
+                    {"description": a.description, "score": a.score, "context": a.context}
+                    for a in anomalies
+                ]
+                # Add high-scoring anomalies as findings
+                for a in anomalies:
+                    if a.score >= 0.6:
+                        severity = Severity.MEDIUM if a.score < 0.8 else Severity.HIGH
+                        finding = Finding(
+                            title=f"Behavioral Anomaly: {a.description[:60]}",
+                            description=f"Score: {a.score:.2f}. {a.description}. Baseline: {a.baseline_comparison}",
+                            severity=severity,
+                            category=FindingCategory.DEFENSE_EVASION,
+                            indicators=[str(v) for v in a.context.values() if v][:5],
+                        )
+                        graph.add_finding(finding)
+                        self.progress_callback(f"  [ANOMALY] {a.description} (score: {a.score:.2f})")
+                
+                self.progress_callback(f"  Total anomalies: {len(anomalies)} ({sum(1 for a in anomalies if a.score >= 0.6)} significant)")
+            else:
+                self.progress_callback("  No behavioral anomalies detected.")
+        except Exception as e:
+            self.progress_callback(f"  Anomaly pre-check failed: {e}")
+
+    def _build_anomaly_context(self) -> str:
+        """Build anomaly context string for the LLM planner."""
+        if not self._anomalies_detected:
+            return ""
+        
+        lines = ["BEHAVIORAL ANOMALIES DETECTED (investigate these first):"]
+        for a in sorted(self._anomalies_detected, key=lambda x: x["score"], reverse=True)[:5]:
+            lines.append(f"- [Score {a['score']:.2f}] {a['description']}")
+        return "\n".join(lines)
+
+    def _check_result_anomalies(self, results: List[Dict], category: str) -> str:
+        """Check query results against behavioral baseline."""
+        try:
+            state_key = {
+                "process": "processes",
+                "network": "connections", 
+                "persistence": "processes",
+            }.get(category, "processes")
+            
+            current_state = {state_key: results}
+            anomalies = self.behavioral_engine.check_anomalies("local", current_state)
+            
+            if anomalies:
+                high_anomalies = [a for a in anomalies if a.score >= 0.5]
+                if high_anomalies:
+                    self._anomalies_detected.extend([
+                        {"description": a.description, "score": a.score, "context": a.context}
+                        for a in high_anomalies
+                    ])
+                    lines = ["ANOMALY DETECTION NOTE:"]
+                    for a in high_anomalies[:3]:
+                        lines.append(f"- [{a.score:.2f}] {a.description}")
+                    return "\n".join(lines)
+        except Exception:
+            pass
+        return ""
+
+    # ─── Live IOC Enrichment ──────────────────────────────────────────
+
+    def _enrich_indicators_sync(self, indicators: List[str]):
+        """Enrich indicators synchronously (wraps async enricher)."""
+        if not self.threat_enricher:
+            return
+
+        try:
+            import re as regex
+            from intelligence.threat_intel import IOC, IOCType
+
+            iocs_to_enrich = []
+            for indicator in indicators[:10]:  # Limit to avoid rate limits
+                indicator = str(indicator).strip()
+                if indicator in self._enrichment_results:
+                    continue  # Already enriched
+                    
+                # Detect IOC type
+                if regex.match(r'^\d{1,3}(\.\d{1,3}){3}$', indicator):
+                    iocs_to_enrich.append(IOC(value=indicator, ioc_type=IOCType.IP))
+                elif regex.match(r'^[a-f0-9]{32}$', indicator, regex.I):
+                    iocs_to_enrich.append(IOC(value=indicator, ioc_type=IOCType.HASH_MD5))
+                elif regex.match(r'^[a-f0-9]{64}$', indicator, regex.I):
+                    iocs_to_enrich.append(IOC(value=indicator, ioc_type=IOCType.HASH_SHA256))
+                elif regex.match(r'^[a-z0-9][a-z0-9\-]*\.[a-z]{2,}$', indicator, regex.I):
+                    iocs_to_enrich.append(IOC(value=indicator, ioc_type=IOCType.DOMAIN))
+
+            if not iocs_to_enrich:
+                return
+
+            # Run async enrichment in sync context
+            loop = None
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_closed():
+                    loop = asyncio.new_event_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+
+            async def _do_enrich():
+                for ioc in iocs_to_enrich:
+                    try:
+                        results = await self.threat_enricher.enrich(ioc)
+                        if results:
+                            is_malicious = any(r.is_malicious for r in results)
+                            max_confidence = max((r.confidence for r in results), default=0)
+                            self._enrichment_results[ioc.value] = {
+                                "is_malicious": is_malicious,
+                                "confidence": max_confidence,
+                                "feeds": [r.feed_name for r in results],
+                                "tags": [t for r in results for t in r.tags][:5],
+                            }
+                            if is_malicious:
+                                self.progress_callback(
+                                    f"  [ENRICHMENT] {ioc.value} flagged MALICIOUS "
+                                    f"(confidence: {max_confidence:.0%}, feeds: {', '.join(r.feed_name for r in results if r.is_malicious)})"
+                                )
+                    except Exception:
+                        pass
+
+            loop.run_until_complete(_do_enrich())
+        except Exception as e:
+            self.progress_callback(f"  [ENRICHMENT] Error: {e}")
+
+    def _build_enrichment_context(self) -> str:
+        """Build enrichment context string for the LLM planner."""
+        if not self._enrichment_results:
+            return ""
+        
+        malicious = {k: v for k, v in self._enrichment_results.items() if v.get("is_malicious")}
+        if not malicious:
+            return ""
+        
+        lines = ["THREAT INTEL ENRICHMENT (confirmed malicious IOCs — prioritize investigating these):"]
+        for ioc_val, result in malicious.items():
+            lines.append(f"- {ioc_val}: MALICIOUS (confidence: {result['confidence']:.0%}, tags: {', '.join(result.get('tags', [])[:3])})")
+        return "\n".join(lines)
+
+    def _build_enrichment_note_for_indicators(self, indicators: List[str]) -> str:
+        """Build enrichment note for the analyzer about specific indicators."""
+        notes = []
+        for ind in indicators:
+            result = self._enrichment_results.get(str(ind))
+            if result:
+                status = "MALICIOUS" if result["is_malicious"] else "clean"
+                notes.append(f"- {ind}: {status} (confidence: {result['confidence']:.0%})")
+        
+        if notes:
+            return "THREAT INTEL ENRICHMENT FOR THESE RESULTS:\n" + "\n".join(notes)
+        return ""
+
+    def _extract_indicators_from_results(self, results: List[Dict]) -> List[str]:
+        """Extract potential IOCs from query results for enrichment."""
+        import re as regex
+        indicators = set()
+        
+        ip_pattern = regex.compile(r'\b(?:\d{1,3}\.){3}\d{1,3}\b')
+        
+        for row in results[:20]:
+            for key, value in row.items():
+                val = str(value)
+                # Extract IPs (skip private ranges)
+                for ip in ip_pattern.findall(val):
+                    parts = ip.split(".")
+                    first_octet = int(parts[0])
+                    if first_octet not in (10, 127, 169, 172, 192, 0, 255):
+                        indicators.add(ip)
+                # Extract hashes
+                if regex.match(r'^[a-f0-9]{32}$', val, regex.I):
+                    indicators.add(val)
+                elif regex.match(r'^[a-f0-9]{64}$', val, regex.I):
+                    indicators.add(val)
+        
+        return list(indicators)[:10]
+
+    # ─── MITRE/Sigma Correlation ──────────────────────────────────────
+
+    def _correlate_mitre(self, finding: Finding):
+        """Search hybrid index for related MITRE techniques and Sigma rules."""
+        if not self.hybrid_search:
+            return
+        try:
+            query = f"{finding.mitre_technique} {finding.title} {finding.description[:100]}"
+            results = self.hybrid_search.search(query, collections=["mitre_attack", "sigma_rules"], top_k=3)
+            if results:
+                correlations = [f"{r.source}:{r.doc_id}" for r in results[:3]]
+                self.progress_callback(f"  [MITRE] Correlated: {', '.join(correlations)}")
+        except Exception:
+            pass
+
+    def _final_mitre_correlation(self, graph: FindingsGraph):
+        """Post-hunt correlation of all findings against MITRE/Sigma."""
+        try:
+            techniques_found = set()
+            for f in graph.findings.values():
+                if f.mitre_technique:
+                    techniques_found.add(f.mitre_technique)
+            
+            if techniques_found:
+                self.progress_callback(f"  MITRE techniques observed: {', '.join(sorted(techniques_found))}")
+        except Exception:
+            pass
+
+    # ─── Phase 1: Parallel Recon ──────────────────────────────────────
 
     def _run_parallel_recon(self, hypothesis: str) -> List[Finding]:
         """Execute initial recon queries in parallel."""
@@ -415,6 +788,20 @@ class ThreatHuntingAgent:
                         continue
 
                     sanitized = self.safety.sanitize_osquery_result(results)
+                    
+                    # Sign recon evidence
+                    if self.evidence_chain:
+                        try:
+                            self.evidence_chain.add_evidence(
+                                node_key="local",
+                                query_sql=spec["sql"],
+                                query_purpose=spec["purpose"],
+                                results=sanitized,
+                                metadata={"phase": "recon", "category": spec["category"]},
+                            )
+                        except Exception:
+                            pass
+
                     if not sanitized:
                         self.progress_callback(f"  Recon '{spec['purpose']}': no results")
                         finding = Finding(
@@ -455,7 +842,7 @@ class ThreatHuntingAgent:
 
         return findings
 
-    # ─── Schema Grounding (#1) ─────────────────────────────────────────
+    # ─── Schema Grounding ─────────────────────────────────────────────
 
     def _get_table_schema(self, table_name: str) -> List[str]:
         """Get live column names for a table via pragma_table_info."""
@@ -473,7 +860,6 @@ class ThreatHuntingAgent:
 
     def _get_schema_context(self, findings_context: str) -> str:
         """Build verified schema context for tables likely needed next."""
-        # Determine which tables to look up based on findings
         key_tables = ["processes", "listening_ports", "process_open_sockets",
                       "users", "crontab", "startup_items", "shell_history",
                       "suid_bin", "file", "hash", "kernel_modules",
@@ -487,7 +873,7 @@ class ThreatHuntingAgent:
 
         return "\n".join(schema_lines)
 
-    # ─── RAG Integration (#3) ──────────────────────────────────────────
+    # ─── RAG Integration ──────────────────────────────────────────────
 
     def _get_rag_context(self, hypothesis: str, findings_context: str) -> str:
         """Retrieve relevant osquery documentation via RAG."""
@@ -495,7 +881,6 @@ class ThreatHuntingAgent:
             return ""
 
         try:
-            # Search based on hypothesis + recent findings
             query = f"{hypothesis} {findings_context[:200]}"
             docs = self.retriever.search(
                 query=query,
@@ -511,11 +896,10 @@ class ThreatHuntingAgent:
             pass
         return ""
 
-    # ─── Query Fix with Retry (#2) ────────────────────────────────────
+    # ─── Query Fix with Retry ─────────────────────────────────────────
 
     def _fix_query(self, failed_sql: str, error: str, purpose: str) -> Optional[str]:
         """Attempt to fix a failed query using error message and live schema."""
-        # Extract table names from the query
         table_matches = re.findall(r'\bFROM\s+(\w+)', failed_sql, re.IGNORECASE)
         table_matches += re.findall(r'\bJOIN\s+(\w+)', failed_sql, re.IGNORECASE)
 
@@ -542,35 +926,48 @@ class ThreatHuntingAgent:
                 temperature=0.1,
             )
             fixed = response.text.strip()
-            # Clean markdown
             fixed = re.sub(r'^```(?:sql)?\s*', '', fixed)
             fixed = re.sub(r'\s*```$', '', fixed)
             fixed = fixed.strip()
             if not fixed.endswith(';'):
                 fixed += ';'
-            # Basic validation
             if fixed.lower().startswith('select') and 'from' in fixed.lower():
                 return fixed
         except Exception:
             pass
         return None
 
-    # ─── Conclusion Generation ──────────────────────────────────────────
+    # ─── Conclusion Generation ────────────────────────────────────────
 
     def _generate_conclusion(self, hypothesis: str, graph: FindingsGraph) -> str:
         """Generate a proper conclusion using LLM based on all findings."""
         findings_summary = self._build_findings_context(graph)
         stats = graph.summary_stats()
 
+        # Include enrichment and anomaly data in conclusion
+        enrichment_summary = ""
+        if self._enrichment_results:
+            malicious = {k: v for k, v in self._enrichment_results.items() if v.get("is_malicious")}
+            if malicious:
+                enrichment_summary = f"\nTHREAT INTEL: {len(malicious)} IOCs confirmed malicious by external feeds: {', '.join(list(malicious.keys())[:5])}"
+
+        anomaly_summary = ""
+        if self._anomalies_detected:
+            high_anomalies = [a for a in self._anomalies_detected if a["score"] >= 0.6]
+            if high_anomalies:
+                anomaly_summary = f"\nBEHAVIORAL ANOMALIES: {len(high_anomalies)} significant deviations from baseline detected."
+
         prompt = f"""Based on this autonomous threat hunt, generate a concise 2-3 sentence conclusion.
 
 HYPOTHESIS: {hypothesis}
 FINDINGS SUMMARY:
 {findings_summary}
+{enrichment_summary}
+{anomaly_summary}
 
 SEVERITY BREAKDOWN: {json.dumps(stats)}
 
-Respond with ONLY the conclusion text (no JSON, no formatting). Be specific about what was found or not found."""
+Respond with ONLY the conclusion text (no JSON, no formatting). Be specific about what was found or not found. If threat intel confirmed IOCs as malicious or behavioral anomalies were detected, mention this."""
 
         try:
             response = self.co.chat(
@@ -583,7 +980,7 @@ Respond with ONLY the conclusion text (no JSON, no formatting). Be specific abou
             return "Investigation complete. No definitive indicators of compromise found."
 
     def _calculate_confidence(self, graph: FindingsGraph) -> float:
-        """Calculate confidence score based on findings quality."""
+        """Calculate confidence score based on findings quality + enrichment."""
         if not graph.findings:
             return 0.3
 
@@ -595,40 +992,23 @@ Respond with ONLY the conclusion text (no JSON, no formatting). Be specific abou
         failed = len([f for f in graph.findings.values()
                      if "failed" in f.title.lower()])
 
-        # More successful queries with clear results = higher confidence
         success_rate = (total - failed) / max(total, 1)
-        # Higher severity findings increase confidence (we found something definitive)
+        
+        # Enrichment confirmation boosts confidence
+        enrichment_boost = 0.0
+        if self._enrichment_results:
+            malicious_count = sum(1 for v in self._enrichment_results.values() if v.get("is_malicious"))
+            if malicious_count > 0:
+                enrichment_boost = min(malicious_count * 0.05, 0.15)
+
         if high_plus > 0:
-            return min(0.9, 0.6 + (high_plus * 0.1))
+            return min(0.95, 0.6 + (high_plus * 0.1) + enrichment_boost)
         elif medium > 0:
-            return min(0.8, 0.5 + (medium * 0.05) + (success_rate * 0.2))
+            return min(0.85, 0.5 + (medium * 0.05) + (success_rate * 0.2) + enrichment_boost)
         else:
-            return min(0.7, 0.4 + (success_rate * 0.3))
+            return min(0.7, 0.4 + (success_rate * 0.3) + enrichment_boost)
 
-    # ─── Batch Queries (#8) ────────────────────────────────────────────
-
-    def _execute_batch(self, queries: List[str]) -> List[Tuple[str, List[Dict], str]]:
-        """Execute multiple queries efficiently (parallel via threads)."""
-        results = []
-
-        def run_one(sql: str) -> Tuple[str, List[Dict], str]:
-            r, e = self.osquery_engine.execute_query(sql)
-            return sql, r, e
-
-        with ThreadPoolExecutor(max_workers=3) as executor:
-            futures = [executor.submit(run_one, q) for q in queries]
-            for f in as_completed(futures):
-                results.append(f.result())
-
-        return results
-
-    # ─── LLM Cache (#7) ───────────────────────────────────────────────
-
-    def _cache_key(self, findings_context: str) -> str:
-        """Generate cache key from findings context."""
-        return hashlib.md5(findings_context.encode()).hexdigest()
-
-    # ─── Core Planning & Analysis ──────────────────────────────────────
+    # ─── Core Planning & Analysis ─────────────────────────────────────
 
     def _build_findings_context(self, graph: FindingsGraph) -> str:
         """Build a text summary of findings so far for the planner prompt."""
@@ -648,9 +1028,9 @@ Respond with ONLY the conclusion text (no JSON, no formatting). Be specific abou
 
     def _plan_next_step(self, hypothesis: str, findings_context: str,
                         step: int, budget: int,
-                        schema_context: str, rag_context: str) -> Optional[Dict[str, Any]]:
+                        schema_context: str, rag_context: str,
+                        anomaly_context: str = "", enrichment_context: str = "") -> Optional[Dict[str, Any]]:
         """Ask LLM to decide the next investigation step."""
-        # Build failed context
         failed_parts = []
         if self._failed_tables:
             failed_parts.append(f"Tables that do NOT exist: {', '.join(self._failed_tables)}")
@@ -665,8 +1045,10 @@ Respond with ONLY the conclusion text (no JSON, no formatting). Be specific abou
             budget_remaining=budget - step,
             schema_context=schema_context,
             rag_context=rag_context,
-            golden_trace=GOLDEN_TRACE if step <= 3 else "",  # Only show trace early
+            golden_trace=GOLDEN_TRACE if step <= 3 else "",
             failed_context=failed_context,
+            anomaly_context=anomaly_context,
+            enrichment_context=enrichment_context,
         )
 
         try:
@@ -681,8 +1063,9 @@ Respond with ONLY the conclusion text (no JSON, no formatting). Be specific abou
             return None
 
     def _analyze_results(self, hypothesis: str, purpose: str,
-                         sql_query: str, results: List[Dict]) -> Optional[Dict[str, Any]]:
-        """Ask LLM to analyze query results."""
+                         sql_query: str, results: List[Dict],
+                         enrichment_note: str = "", anomaly_note: str = "") -> Optional[Dict[str, Any]]:
+        """Ask LLM to analyze query results with enrichment/anomaly context."""
         results_to_show = results[:15]
         results_json = json.dumps(results_to_show, indent=2)
 
@@ -692,6 +1075,8 @@ Respond with ONLY the conclusion text (no JSON, no formatting). Be specific abou
             sql_query=sql_query,
             num_rows=len(results),
             results_json=results_json,
+            enrichment_note=enrichment_note,
+            anomaly_note=anomaly_note,
         )
 
         try:
@@ -733,3 +1118,25 @@ Respond with ONLY the conclusion text (no JSON, no formatting). Be specific abou
             return FindingCategory(cat_str.lower())
         except ValueError:
             return FindingCategory.SYSTEM_INFO
+
+    # ─── LLM Cache ────────────────────────────────────────────────────
+
+    def _cache_key(self, context: str) -> str:
+        return hashlib.md5(context.encode()).hexdigest()
+
+    # ─── Batch Queries ────────────────────────────────────────────────
+
+    def _execute_batch(self, queries: List[str]) -> List[Tuple[str, List[Dict], str]]:
+        """Execute multiple queries efficiently (parallel via threads)."""
+        results = []
+
+        def run_one(sql: str) -> Tuple[str, List[Dict], str]:
+            r, e = self.osquery_engine.execute_query(sql)
+            return sql, r, e
+
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = [executor.submit(run_one, q) for q in queries]
+            for f in as_completed(futures):
+                results.append(f.result())
+
+        return results

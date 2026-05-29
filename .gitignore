@@ -148,3 +148,30 @@ test_folder/
 rz*
 lia_memory.json
 Hound_memory.json
+hunt_history.json
+
+# HoundAI Production
+data/chroma_db/
+*.pem
+*.key
+evidence_keys/
+
+# Database
+*.sql
+alembic/versions/*.py
+
+# Message queue / telemetry
+*.nats
+*.kafka
+
+# Secrets & env files
+.env
+.env.*
+!.env.example
+
+# Runtime data
+pyvenv.cfg
+.pgdata/
+.nats-data/
+.nats.pid
+.nats.log

@@ -6,3 +6,26 @@ tabulate
 chromadb>=0.4.0
 sentence-transformers
 rich
+
+# Production — API & delivery
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+pydantic>=2.0
+
+# Production — database
+sqlalchemy[asyncio]>=2.0
+asyncpg
+alembic
+
+# Production — auth & crypto
+pyjwt[crypto]
+cryptography>=42.0
+
+# Production — message queue
+nats-py>=2.6.0
+aiokafka
+
+# Production — telemetry & enrichment
+aiohttp>=3.9.0
+pyyaml
+croniter

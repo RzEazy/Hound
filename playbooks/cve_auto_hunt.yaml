@@ -1,0 +1,68 @@
+# HoundAI Playbook: New CVE Exploit Detection (Trigger-based)
+# Auto-fires when a new high-severity CVE is published
+
+id: cve_auto_hunt
+name: "Auto-Hunt for New CVE Indicators"
+description: |
+  Triggered automatically when a new CVE with CVSS >= 8.0 is published.
+  Hunts for indicators that the specific exploit has been used against fleet hosts.
+  Dynamically adapts queries based on CVE metadata and affected software.
+version: "1.0"
+author: "HoundAI Security Team"
+tags: [cve, vulnerability, initial_access, exploitation]
+mitre_techniques: [T1190, T1203]
+
+hypothesis_template: |
+  Hunt for exploitation indicators of {cve_id} across the fleet.
+  Check for: vulnerable software versions, exploitation artifacts,
+  post-exploitation behavior, and IOCs from threat intelligence.
+
+triggers:
+  - type: new_cve
+    conditions:
+      cvss_minimum: 8.0
+      affected_products: ["*"]  # All products, or specify ["apache", "nginx"]
+      
+  - type: alert
+    name: vulnerability_scan_finding
+    conditions:
+      severity: critical
+
+targets:
+  config_groups: [all]
+
+steps:
+  - name: "Check for vulnerable software versions"
+    query: "SELECT name, version, source FROM deb_packages WHERE name LIKE '%{affected_package}%' UNION SELECT name, version, source FROM rpm_packages WHERE name LIKE '%{affected_package}%' LIMIT 50;"
+    description: "Identify hosts running vulnerable software versions"
+    category: "system_info"
+    severity_threshold: "medium"
+
+  - name: "Check for exploitation process artifacts"
+    query: "SELECT pid, name, path, cmdline, uid FROM processes WHERE path LIKE '/tmp/%' OR path LIKE '/dev/shm/%' OR cmdline LIKE '%/tmp/%' LIMIT 50;"
+    description: "Look for processes spawned from exploitation (temp paths)"
+    category: "execution"
+    severity_threshold: "high"
+
+  - name: "Network connections to known exploit infrastructure"
+    query: "SELECT p.name, p.pid, pos.remote_address, pos.remote_port FROM process_open_sockets pos JOIN processes p ON pos.pid = p.pid WHERE pos.remote_address != '' AND pos.remote_port IN (4444, 5555, 8888, 9001, 1234) LIMIT 50;"
+    description: "Check for reverse shell connections to attacker infrastructure"
+    category: "network"
+    severity_threshold: "critical"
+
+  - name: "Recent suspicious file modifications"
+    query: "SELECT path, mtime, uid FROM file WHERE path LIKE '/etc/cron.d/%' OR path LIKE '/root/.ssh/authorized_keys' AND mtime > (strftime('%s','now') - 86400) LIMIT 50;"
+    description: "Check for recent persistence file modifications"
+    category: "persistence"
+    severity_threshold: "high"
+
+escalation:
+  - severity: "critical"
+    action: "notify"
+    targets: ["slack:#incident-response", "pagerduty:vuln-oncall"]
+    message: "CRITICAL: Active exploitation of {cve_id} detected on fleet hosts."
+
+  - severity: "high"
+    action: "notify"
+    targets: ["slack:#security-alerts"]
+    message: "HIGH: Potential exploitation indicators for {cve_id} found. Review hunt {hunt_id}."

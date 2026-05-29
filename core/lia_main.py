@@ -36,6 +36,13 @@ class LiaMain:
         # Initialize threat hunting components
         self.report_generator = ReportGenerator()
         self.last_hunt: Optional[FindingsGraph] = None
+        
+        # Production subsystems (set by TUI's ServiceManager)
+        self.behavioral_engine = None
+        self.threat_enricher = None
+        self.evidence_chain = None
+        self.hybrid_search = None
+        self.hitl_callback = None
 
     
     def process_input(self, user_input: str) -> str:
@@ -164,7 +171,7 @@ class LiaMain:
 
     def _handle_hunt(self, user_input: str, 
                      progress_callback: Optional[Callable[[str], None]] = None) -> str:
-        """Execute an autonomous threat hunt."""
+        """Execute an autonomous threat hunt with production subsystem integration."""
         if not self.osquery_engine.is_osquery_installed():
             return "Osquery is not installed. The threat hunter requires osquery to investigate this system."
 
@@ -189,6 +196,12 @@ class LiaMain:
             safety_checker=self.safety,
             retriever=retriever,
             progress_callback=progress_callback or (lambda msg: None),
+            # Production subsystems
+            behavioral_engine=self.behavioral_engine,
+            threat_enricher=self.threat_enricher,
+            evidence_chain=self.evidence_chain,
+            hybrid_search=self.hybrid_search,
+            hitl_callback=self.hitl_callback,
         )
 
         graph = agent.hunt(hypothesis)

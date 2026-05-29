@@ -1,0 +1,74 @@
+# HoundAI Playbook: Ransomware Pre-Encryption Indicators
+# Runs nightly to detect early-stage ransomware behavior before encryption begins
+
+id: ransomware_precursors
+name: "Ransomware Pre-Encryption Detection"
+description: |
+  Hunts for behavioral indicators that precede ransomware encryption:
+  shadow copy deletion, process injection, lateral movement tools,
+  and bulk file enumeration patterns.
+version: "1.0"
+author: "HoundAI Security Team"
+tags: [ransomware, persistence, defense_evasion, impact]
+mitre_techniques: [T1490, T1055, T1021.002, T1083, T1486]
+
+hypothesis_template: |
+  Investigate whether any hosts show pre-encryption ransomware indicators:
+  shadow copy deletion, VSS manipulation, suspicious process spawning patterns,
+  or bulk file system enumeration consistent with encryption preparation.
+
+schedule:
+  cron: "0 2 * * *"  # Every night at 2 AM
+
+targets:
+  config_groups: [all]
+  tags: [windows, workstation, server]
+
+steps:
+  - name: "Shadow copy deletion attempts"
+    query: "SELECT pid, name, cmdline, path, parent FROM processes WHERE cmdline LIKE '%vssadmin%delete%' OR cmdline LIKE '%wmic%shadowcopy%' OR cmdline LIKE '%bcdedit%recoveryenabled%' LIMIT 50;"
+    description: "Detect attempts to delete volume shadow copies (T1490)"
+    category: "defense_evasion"
+    severity_threshold: "critical"
+
+  - name: "Suspicious PowerShell encoding"
+    query: "SELECT pid, name, cmdline, uid FROM processes WHERE name = 'powershell.exe' AND (cmdline LIKE '%-enc%' OR cmdline LIKE '%-EncodedCommand%' OR cmdline LIKE '%FromBase64String%') LIMIT 50;"
+    description: "Detect encoded PowerShell execution often used in ransomware loaders"
+    category: "execution"
+    severity_threshold: "high"
+
+  - name: "Lateral movement tools"
+    query: "SELECT pid, name, path, cmdline FROM processes WHERE name IN ('psexec.exe', 'psexec64.exe', 'wmic.exe', 'mstsc.exe', 'net.exe') AND cmdline LIKE '%\\\\%' LIMIT 50;"
+    description: "Detect lateral movement tools accessing remote shares"
+    category: "lateral_movement"
+    severity_threshold: "high"
+
+  - name: "Bulk file enumeration"
+    query: "SELECT pid, name, path FROM processes WHERE name IN ('dir.exe', 'tree.exe', 'forfiles.exe') OR (name = 'cmd.exe' AND cmdline LIKE '%/s /b%') LIMIT 50;"
+    description: "Detect bulk file system enumeration preceding encryption"
+    category: "discovery"
+    severity_threshold: "medium"
+
+  - name: "Known ransomware process names"
+    query: "SELECT pid, name, path, cmdline, uid FROM processes WHERE name IN ('conti.exe', 'lockbit.exe', 'ryuk.exe', 'maze.exe', 'revil.exe', 'blackcat.exe') OR path LIKE '/tmp/%' AND name LIKE '%.exe' LIMIT 50;"
+    description: "Direct detection of known ransomware binary names"
+    category: "impact"
+    severity_threshold: "critical"
+
+  - name: "Unusual file extension creation (encryption markers)"
+    query: "SELECT target_path, action, time FROM file_events WHERE (target_path LIKE '%.encrypted' OR target_path LIKE '%.locked' OR target_path LIKE '%.crypto' OR target_path LIKE '%.WNCRY') LIMIT 50;"
+    description: "Detect creation of files with known ransomware extensions"
+    category: "impact"
+    severity_threshold: "critical"
+    timeout: 60
+
+escalation:
+  - severity: "critical"
+    action: "notify"
+    targets: ["slack:#incident-response", "pagerduty:ransomware-oncall"]
+    message: "CRITICAL: Ransomware pre-encryption indicators detected on {hostname}. Immediate investigation required."
+
+  - severity: "high"
+    action: "notify"
+    targets: ["slack:#security-alerts", "email:soc@company.com"]
+    message: "HIGH: Potential ransomware precursor activity detected. Review hunt {hunt_id}."
