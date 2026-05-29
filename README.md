@@ -1,244 +1,252 @@
-# LiaAI — 0.3.0
+# HoundAI — Autonomous Threat Hunting Engine
 
-LiaAI has evolved into a modular, LLM-powered cyber-OS assistant with three core capabilities:
-
-1. **Natural Language Chat** - General conversation and assistance
-2. **OS Command Execution** - Safe execution of system commands
-3. **Osquery Security Engine** - Security questioning and system forensics
-
-## 🏗️ System Architecture
-
-LiaAI follows a modular, chain-based architecture that separates concerns and enables extensibility. The system consists of several interconnected components that work together to process user input and generate appropriate responses.
+An LLM-powered cybersecurity assistant that performs **autonomous threat investigations** using osquery. HoundAI doesn't just answer questions — it plans, executes, pivots, and reports like a human threat hunter.
 
 ```
-lia_ai/
-├── core/                  # Core modules (router, memory, safety)
-├── chains/                # Processing chains (chat, OS, osquery)
-├── tools/                 # Formatting and utility tools
-├── engines/               # Execution engines (OS, osquery)
-├── rag/                   # Retrieval-Augmented Generation components
-├── utils/                 # Utilities and templates
-├── data/                  # Persistent data storage (ChromaDB)
-├── Docs/                  # Documentation and prompts
-├── app.py                 # Main application entry point
-└── lia_ai.py              # Legacy implementation (deprecated)
+ ██╗  ██╗ ██████╗ ██╗   ██╗███╗   ██╗██████╗
+ ██║  ██║██╔═══██╗██║   ██║████╗  ██║██╔══██╗
+ ███████║██║   ██║██║   ██║██╔██╗ ██║██║  ██║
+ ██╔══██║██║   ██║██║   ██║██║╚██╗██║██║  ██║
+ ██║  ██║╚██████╔╝╚██████╔╝██║ ╚████║██████╔╝
+ ╚═╝  ╚═╝ ╚═════╝  ╚═════╝ ╚═╝  ╚═══╝╚═════╝
 ```
 
-### Component Design
+## What Makes This Different
 
-#### Core Modules (`core/`)
-- **IntentRouter**: Classifies user input into appropriate processing chains
-- **MemoryManager**: Manages conversation history and context
-- **SafetyChecker**: Validates commands and queries for security compliance
+Most security tools require you to know what to look for. HoundAI takes a hypothesis — *"is this machine compromised?"* — and autonomously:
 
-#### Processing Chains (`chains/`)
-- **ChatChain**: Handles general conversation using LLM
-- **OSCommandChain**: Converts natural language to safe OS commands
-- **OsqueryChain**: Translates security questions to osquery SQL with RAG support
+1. **Plans** investigation steps using chain-of-thought reasoning
+2. **Executes** osquery queries against the live system
+3. **Analyzes** results and identifies indicators of compromise
+4. **Pivots** dynamically based on what it finds (suspicious PID → trace network connections → check persistence)
+5. **Concludes** with a confidence-scored report and IOC list
 
-#### Execution Engines (`engines/`)
-- **CommandEngine**: Safely executes OS commands with timeout protection
-- **OsqueryEngine**: Executes osquery SQL statements and returns results
+No pre-written rules. No static playbooks. The agent *reasons* about findings in real-time.
 
-#### RAG Components (`rag/`)
-- **VectorDB**: ChromaDB wrapper for document storage and retrieval
-- **Retriever**: Finds relevant documentation for query context
-- **Embedder**: Converts text to vector embeddings (handled by Cohere)
-- **Ingestion**: Scripts to populate vector database with osquery documentation
+---
 
-#### Tools (`tools/`)
-- **ResultFormatter**: Formats output for clean, readable presentation
-- **SecurityDashboard**: Generates comprehensive security status reports
+## Features
 
-#### Utilities (`utils/`)
-- **PromptTemplates**: Standardized prompt formats for consistency
-- **Configuration**: Shared constants and configuration values
+### Autonomous Threat Hunting
+- **Dynamic budget system** — starts with 10 steps, extends automatically when HIGH/CRITICAL findings appear (ceiling: 25)
+- **Parallel initial recon** — 5 queries run simultaneously at hunt start (processes, network, crontab, SUID, listening ports)
+- **Schema-grounded queries** — uses live `PRAGMA table_info` to prevent column hallucination
+- **Auto-retry with error correction** — failed queries are fixed using verified schema and retried
+- **RAG-enhanced planning** — retrieves relevant osquery documentation for each investigation step
+- **Few-shot investigation traces** — guides the LLM with golden examples of real investigations
+- **LLM response caching** — avoids redundant API calls when context hasn't changed
 
-## 🔄 Workflow Process
+### Professional TUI
+- **Real-time hunt dashboard** — split-pane layout with findings table + live investigation log
+- **Progress tracking** — step counter, severity counters, dynamic budget bar
+- **Interactive findings viewer** — severity-sorted table with expandable detail panels
+- **Command palette** — structured `/commands` for all operations
+- **Hunt history** — persisted sessions, viewable anytime
+- **Themed branding** — consistent purple/cyan color palette throughout
+- **Rich osquery tables** — styled output with suspicious value highlighting
 
-1. **Input Reception**: User input is received through the CLI interface in `app.py`
+### Core Capabilities
+- **Natural language chat** — general conversation via Cohere LLM
+- **OS command execution** — translates natural language to safe system commands
+- **Osquery security engine** — translates questions to osquery SQL with RAG
+- **Multi-layer safety** — command blocklists, SQL injection prevention, sensitive column stripping, 30s timeouts
 
-2. **Context Retrieval**: 
-   - MemoryManager retrieves conversation history and previous queries
-   - Context is passed to subsequent processing steps
+---
 
-3. **Intent Classification**:
-   - IntentRouter analyzes input using LLM classification
-   - Determines appropriate processing chain (Chat, OS Command, or Osquery)
-
-4. **Chain Processing**:
-   - **Chat Chain**: Direct LLM processing for conversational queries
-   - **OS Command Chain**: 
-     * Converts natural language to system commands
-     * Applies safety checks before execution
-   - **Osquery Chain**:
-     * Uses RAG to retrieve relevant osquery documentation
-     * Generates SQL queries with contextual examples
-     * Applies comprehensive security validation
-
-5. **Execution**:
-   - **Command Engine**: Executes validated OS commands with timeout protection
-   - **Osquery Engine**: Runs validated SQL queries against system database
-
-6. **Result Processing**:
-   - SafetyChecker sanitizes output to remove sensitive information
-   - ResultFormatter structures data for clean presentation
-   - MemoryManager stores interaction for future context
-
-7. **Response Delivery**: Formatted response is returned to user through CLI
-
-### Data Flow Diagram
+## Architecture
 
 ```
-User Input → [Intent Router] → [Processing Chain] → [Execution Engine] → [Safety Check] → [Formatting] → User Output
-     ↑              ↓                ↓                    ↓                 ↓              ↓              ↑
-   Memory ← [Context Retrieval] → [RAG Retrieval] → [Query Generation] → [Validation] → [Presentation] → Memory
+User Input (TUI)
+  │
+  ├─ /hunt ─→ ThreatHuntingAgent
+  │             ├─ Phase 1: Parallel Recon (5 queries, ThreadPoolExecutor)
+  │             └─ Phase 2: Adaptive Loop
+  │                  ├─ _get_schema_context() → PRAGMA table_info (live)
+  │                  ├─ _get_rag_context() → ChromaDB retrieval
+  │                  ├─ _plan_next_step() → Cohere LLM (planner)
+  │                  ├─ execute_query() → osqueryi --json
+  │                  ├─ _fix_query() → retry on error with verified schema
+  │                  ├─ _analyze_results() → Cohere LLM (analyzer)
+  │                  └─ FindingsGraph ← store finding + adjust budget
+  │             └─ ReportGenerator → markdown/JSON report
+  │
+  ├─ Chat ──→ IntentRouter → ChatChain → Cohere LLM
+  ├─ OS ────→ IntentRouter → OSCommandChain → RAG → CommandEngine
+  └─ Query ─→ IntentRouter → OsqueryChain → RAG → OsqueryEngine
 ```
 
-### RAG Pipeline
-
-1. **Document Ingestion**:
-   - Osquery table schemas fetched from GitHub specifications
-   - Documentation parsed into structured format
-   - Text converted to embeddings using Cohere
-   - Stored in ChromaDB vector database
-
-2. **Query-Time Retrieval**:
-   - User input embedded using Cohere
-   - Similarity search against document vectors
-   - Top-k relevant documents retrieved
-   - Documents injected into LLM prompt context
-
-3. **Enhanced Generation**:
-   - LLM generates SQL with relevant table/column context
-   - Examples from documentation guide proper syntax
-   - Reduced hallucination through grounded retrieval
-
-## 🛠️ Installation
-
-1. Install Python dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-2. Install osquery:
-   ```bash
-   # Ubuntu/Debian
-   sudo apt-get install osquery
-   
-   # macOS
-   brew install osquery
-   
-   # Windows
-   Download from https://osquery.io/downloads
-   ```
-
-3. Set up RAG database:
-   ```bash
-   # Navigate to the ingestion directory
-   cd rag/ingestion
-   
-   # Run the ingestion scripts to populate the vector database
-   python ingest_commands.py
-   python ingest_osquery.py
-   
-   # Copy the database to the main application directory
-   cp -r data/chroma_db/* ../../data/chroma_db/
-   ```
-
-## 🚨 Troubleshooting
-
-### Collection Does Not Exist Error
-If you encounter "Collection [osquery_docs] does not exist" errors:
-1. Ensure you've run the ingestion scripts in `rag/ingestion/`
-2. Verify that the database files were copied from `rag/ingestion/data/chroma_db/` to `data/chroma_db/`
-3. Check that the ChromaDB service is running and accessible
-
-### Database Path Issues
-The application and ingestion scripts must use the same database path. The default path is `data/chroma_db/` relative to the project root.
-
-### Module Import Errors
-If you encounter import errors when running ingestion scripts:
-```bash
-# Run from the project root with PYTHONPATH set
-cd /path/to/LiaAI
-PYTHONPATH=. python rag/ingestion/ingest_osquery.py
+```
+HoundAI/
+├── tui.py                    # Professional TUI (entry point)
+├── core/
+│   ├── lia_main.py           # Central orchestrator
+│   ├── router.py             # LLM intent classifier
+│   ├── memory.py             # Conversation persistence
+│   └── safety.py             # Multi-layer safety checker
+├── hunting/
+│   ├── agent.py              # Autonomous threat hunting agent
+│   ├── findings.py           # Findings graph (evidence chains)
+│   └── report.py             # Report generator (markdown/JSON)
+├── chains/
+│   ├── base_chain.py         # Abstract base
+│   ├── chat_chain.py         # General chat
+│   ├── os_chain.py           # NL → OS commands
+│   └── osquery_chain.py      # NL → osquery SQL
+├── engines/
+│   ├── command_engine.py     # subprocess execution
+│   └── osquery_engine.py     # osqueryi execution
+├── rag/
+│   ├── vectordb.py           # ChromaDB wrapper
+│   ├── retriever.py          # Similarity search
+│   ├── embedder.py           # sentence-transformers
+│   └── ingestion/            # Data ingestion scripts
+├── tools/
+│   ├── formatter.py          # Output formatting
+│   └── security_dashboard.py # Security overview
+├── data/chroma_db/           # Persistent vector store
+├── hunt_history.json         # Hunt session history
+└── Hound_memory.json         # Conversation memory
 ```
 
-### Checking ChromaDB Embeddings
-To verify that embeddings have been properly ingested, you can check the database directly:
+---
+
+## Installation
+
+### Using Nix (recommended)
 
 ```bash
-# List collections and document counts
-sqlite3 data/chroma_db/chroma.sqlite3 "SELECT c.name, COUNT(s.id) as segments, COUNT(e.id) as embeddings FROM collections c LEFT JOIN segments s ON c.id = s.collection LEFT JOIN embeddings e ON s.id = e.segment_id GROUP BY c.id, c.name;"
-
-# List available collections
-sqlite3 data/chroma_db/chroma.sqlite3 "SELECT id, name, dimension FROM collections;"
+nix-shell
+python tui.py
 ```
 
-## ▶️ Usage
+The `shell.nix` automatically creates a venv, installs all dependencies, and sets up the environment.
 
-Run the application:
+### Manual Setup
+
 ```bash
-python app.py
+# 1. Install osquery
+# Ubuntu/Debian
+sudo apt-get install osquery
+# macOS
+brew install osquery
+# NixOS
+nix-env -iA nixpkgs.osquery
+
+# 2. Create venv and install deps
+python3.12 -m venv env
+source env/bin/activate
+pip install -r requirements.txt
+
+# 3. Set API key
+export COHERE_API_KEY="your-key-here"
+
+# 4. Populate RAG database (optional but recommended)
+cd rag/ingestion
+python ingest_osquery.py
+python ingest_commands.py
+
+# 5. Run
+python tui.py
 ```
 
-Then interact with LiaAI using natural language:
+---
 
-### Chat Examples
-- "Hello, how are you?"
-- "What can you help me with?"
+## Usage
 
-### OS Command Examples
-- "Create a folder called projects"
-- "List all files in the current directory"
-- "Show me the disk usage"
+### Commands
 
-### Osquery Examples
-- "Show me all running processes"
-- "What network ports are listening?"
-- "Are there any suspicious login attempts?"
-- "List all users on this system"
-- "Show me recently modified files"
+| Command | Description |
+|---------|-------------|
+| `/hunt [hypothesis]` | Start autonomous threat hunt |
+| `/hunt-fast` | Quick hunt with reduced budget |
+| `/findings` | Interactive findings viewer |
+| `/report` | Full markdown report |
+| `/report brief` | Brief summary |
+| `/export json` | Export hunt as JSON |
+| `/history` | View past hunt sessions |
+| `/history <id>` | View specific hunt details |
+| `/dashboard` | System security dashboard |
+| `/status` | System health check |
+| `/help` | Command palette |
+| `/clear` | Clear screen |
 
-## 🚀 Key Features
+### Natural Language
 
-- **Multi-Modal Processing**: Seamlessly handles chat, OS commands, and security queries
-- **Intent Classification**: Automatically routes requests to the appropriate processor
-- **OS Command Execution**: Converts natural language to safe system commands
-- **Osquery Integration**: Translates security questions to osquery SQL and executes them
-- **Retrieval-Augmented Generation**: Uses RAG for accurate, context-aware SQL generation
-- **Memory Management**: Remembers conversations and previous queries for context
-- **Comprehensive Safety Controls**: Multi-layer protection against dangerous operations
-- **Intelligent Formatting**: Clean, readable results with tabular output
-- **Extensible Architecture**: Modular design for easy feature additions
+Just type normally for chat, OS commands, or security questions:
 
-## 🛡️ Safety Features
+```
+> show me all listening ports
+> what processes are using the most memory
+> are there any unauthorized SSH keys on this system
+```
 
-- Blocks dangerous OS commands (`rm -rf`, `format`, etc.)
-- Prevents destructive osquery operations (`DROP`, `DELETE`, `INSERT`)
-- Protects against SQL injection attacks
-- Sanitizes sensitive data from results
-- Implements timeouts to prevent hanging operations
+### Hunt Examples
 
-## 🧩 Modular Design
+```
+> /hunt investigate if this system has been compromised
+> /hunt check for cryptocurrency miners and C2 channels
+> /hunt look for lateral movement and privilege escalation
+> hunt for persistence mechanisms
+> investigate unauthorized access
+```
 
-The new architecture makes it easy to extend LiaAI with additional capabilities:
+---
 
-- Add new processing chains in `chains/`
-- Implement new tools in `tools/`
-- Extend execution engines in `engines/`
-- Customize core functionality in `core/`
+## How the Hunt Works
 
-## 🔮 Future Expansion Opportunities
+1. **Parallel Recon** — 5 queries fire simultaneously:
+   - Suspicious processes (running from /tmp, known malware names, not on disk)
+   - External network connections (ESTABLISHED to non-local IPs)
+   - Crontab entries (persistence)
+   - SUID binaries in unusual locations (priv esc)
+   - Non-standard listening ports (backdoors)
 
-- Anomaly detection
-- Persistence scanning
-- Real-time monitoring
-- Fleet-wide querying
-- Self-healing automations
-- Threat hunting packs
+2. **Adaptive Investigation** — LLM plans each step based on findings:
+   - Pivots on discovered PIDs, IPs, usernames, file paths
+   - Uses MITRE ATT&CK framework for categorization
+   - Budget extends dynamically when threats are found
+   - Auto-concludes after 4 consecutive low-value steps
 
-## 📄 License
+3. **Error Recovery** — failed queries are automatically fixed:
+   - Extracts table names from failed SQL
+   - Fetches live schema via `PRAGMA table_info`
+   - LLM rewrites query using only verified columns
+
+4. **Report Generation** — produces:
+   - Severity-scored findings with IOC lists
+   - Evidence chains showing investigation flow
+   - MITRE ATT&CK technique mapping
+   - Confidence-scored conclusion
+   - Exportable JSON for SIEM integration
+
+---
+
+## Safety
+
+- Blocks destructive OS commands (`rm -rf`, `mkfs`, `shutdown`, fork bombs)
+- Prevents SQL injection and destructive osquery operations
+- Strips sensitive columns (passwords, tokens, secrets) from results
+- 30-second timeout on all executions
+- Dynamic budget ceiling (25 steps max) prevents runaway investigations
+- All queries validated before execution
+
+---
+
+## Tech Stack
+
+| Component | Technology |
+|-----------|-----------|
+| Language | Python 3.12 |
+| LLM | Cohere (`command-a-03-2025`) |
+| System Forensics | osquery |
+| Vector Database | ChromaDB |
+| Embeddings | sentence-transformers (`all-MiniLM-L6-v2`) |
+| TUI | Rich |
+| Parallelism | ThreadPoolExecutor |
+| Dev Environment | Nix |
+
+---
+
+## License
 
 MIT

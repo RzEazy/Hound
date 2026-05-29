@@ -1,0 +1,28 @@
+[
+  {
+    "hunt_id": "1400023a",
+    "hypothesis": "Investigate this system for signs of compromise, persistence mechanisms, and suspicious activity.",
+    "started_at": "2026-05-29T20:15:04.808813",
+    "ended_at": "2026-05-29T20:16:15.983891",
+    "conclusion": "Investigation complete. No definitive indicators of compromise found, though monitoring is recommended.",
+    "confidence": 0.5,
+    "num_findings": 11,
+    "max_severity": "medium",
+    "indicators": [
+      "151.101.0.176",
+      "2404:6800:4000:1006::5e",
+      "34.120.208.123",
+      "2607:6bc0::10",
+      "34.107.243.93",
+      "2a03:2880:f335:120:face:b00c:0:167",
+      "140.82.113.25",
+      "PID: 8594",
+      "2404:6800:4007:80f::200e",
+      "Process Name: .firefox-wrappe"
+    ],
+    "summary_stats": {
+      "medium": 2,
+      "info": 9
+    }
+  }
+]
